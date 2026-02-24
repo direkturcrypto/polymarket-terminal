@@ -12,7 +12,10 @@
     "mm-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/mm.js",
     "sniper": "DRY_RUN=false node src/sniper.js",
     "sniper-sim": "DRY_RUN=true node src/sniper.js",
-    "sniper-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper.js"
+    "sniper-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper.js",
+    "oneshot": "DRY_RUN=false node src/oneshot.js",
+    "oneshot-sim": "DRY_RUN=true node src/oneshot.js",
+    "oneshot-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/oneshot.js"
   },
   "keywords": [
     "polymarket",
