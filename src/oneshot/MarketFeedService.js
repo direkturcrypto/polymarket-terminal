@@ -177,7 +177,10 @@ export class MarketFeedService {
     }
 
     _parseEndTs(market) {
-        const raw = market.endDateIso || market.end_date_iso || market.endDate;
+        // endDate contains the full datetime (e.g. "2026-02-24T06:35:00Z").
+        // endDateIso is date-only ("2026-02-24") and parses to midnight UTC —
+        // which is already in the past by market-open time, so it must come last.
+        const raw = market.endDate || market.end_date || market.endDateIso || market.end_date_iso;
         if (!raw) return null;
         const ts = new Date(raw).getTime();
         return Number.isFinite(ts) ? ts : null;
