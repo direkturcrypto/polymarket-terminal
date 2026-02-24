@@ -247,7 +247,14 @@ export class MarketFeedService {
 
         for (const [, mkt] of this._markets) {
             const tteSec = Math.floor((mkt.endTs - Date.now()) / 1000);
-            if (tteSec <= 0) continue;
+
+            // Market has expired — emit a synthetic snapshot so the position manager
+            // can detect the expiry and queue the position for on-chain redemption.
+            // Without this, positions in expired markets never reach RedeemEngine.
+            if (tteSec < 0) {
+                this._eventBus.emit('snapshot', this._buildExpiredSnapshot(mkt, tteSec));
+                continue;
+            }
 
             const fetchStart = Date.now();
 
@@ -290,6 +297,28 @@ export class MarketFeedService {
     }
 
     // ── Snapshot builder ──────────────────────────────────────────────────────
+
+    /** Synthetic snapshot emitted when a market has already closed (tteSec < 0). */
+    _buildExpiredSnapshot(mkt, tteSec) {
+        const emptySide = (tokenId) => ({
+            tokenId,
+            bids: [], asks: [],
+            bestBid: 0, bestAsk: 1, mid: 0.5,
+            spread: 1, depthBid: 0, depthAsk: 0,
+            bestBidSize: 0, bestAskSize: 0,
+        });
+        return {
+            ts:          Date.now(),
+            marketSlug:  mkt.slug,
+            conditionId: mkt.conditionId,
+            tteSec,
+            tickSize:    mkt.tickSize,
+            negRisk:     mkt.negRisk,
+            up:          emptySide(mkt.upTokenId),
+            down:        emptySide(mkt.downTokenId),
+            stale:       true,   // blocks SignalEngine gates — no new entries on expired book
+        };
+    }
 
     _buildSnapshot(mkt, upBook, downBook, tteSec, stale) {
         const up   = this._buildSide(mkt.upTokenId,   upBook);
