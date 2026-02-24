@@ -175,6 +175,13 @@ async function onSignal(evt) {
     // Only enter from IDLE — one position per market slot
     if (!sm.is(State.IDLE)) return;
 
+    // Global position limit: never open a new position while any other market
+    // is still being held. The engine is designed to focus on one bet at a time.
+    if (posEngine.hasAnyPosition()) {
+        dbg('SIGNAL', `${marketSlug} | blocked — position already open in another market`);
+        return;
+    }
+
     // ── Risk gate ─────────────────────────────────────────────────────────
 
     const riskCheck = riskEngine.canTrade();

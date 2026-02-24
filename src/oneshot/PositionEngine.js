@@ -68,6 +68,11 @@ export class PositionEngine {
         return this._positions.has(marketSlug);
     }
 
+    /** True if ANY position is open across all tracked markets */
+    hasAnyPosition() {
+        return this._positions.size > 0;
+    }
+
     /**
      * Close the position actively (adverse-move emergency exit) and return exit data.
      *
