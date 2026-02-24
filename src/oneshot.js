@@ -34,6 +34,7 @@ import { ExecutionEngine }  from './oneshot/ExecutionEngine.js';
 import { RiskEngine }       from './oneshot/RiskEngine.js';
 import { PositionEngine }   from './oneshot/PositionEngine.js';
 import { Telemetry }        from './oneshot/Telemetry.js';
+import { RedeemEngine }      from './oneshot/RedeemEngine.js';
 import { State, Signal, ReasonCode } from './oneshot/constants.js';
 import { DEBUG, dbg } from './oneshot/debug.js';
 
@@ -54,6 +55,7 @@ const cfg = {
     cooldownRounds:   parseInt(process.env.ONESHOT_COOLDOWN_ROUNDS     || '3',    10),
     dailyLossCap:     parseFloat(process.env.ONESHOT_DAILY_LOSS_CAP    || '20'),
     fillTimeoutMs:    parseInt(process.env.ONESHOT_FILL_TIMEOUT_MS     || '800',  10),
+    redeemPollMs:     parseInt(process.env.ONESHOT_REDEEM_POLL_MS      || '30000', 10),
     dryRun:           process.env.DRY_RUN !== 'false',
 };
 
@@ -70,6 +72,7 @@ let signalEngine;
 let execEngine;
 let riskEngine;
 let posEngine;
+let redeemEngine;
 let telemetry;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -89,7 +92,12 @@ async function main() {
     await initClient();
     const client = getClient();
 
-    telemetry    = new Telemetry();
+    telemetry     = new Telemetry();
+    redeemEngine  = new RedeemEngine({
+        dryRun:         cfg.dryRun,
+        pollIntervalMs: cfg.redeemPollMs,
+        eventBus,
+    });
     riskEngine   = new RiskEngine({
         maxConsecLosses: cfg.maxConsecLosses,
         cooldownRounds:  cfg.cooldownRounds,
@@ -119,7 +127,15 @@ async function main() {
     eventBus.on('snapshot',         onSnapshotForPositionMgmt);
     eventBus.on('state:transition', onStateTransition);
 
+    redeemEngine.start();
     await feedService.start();
+
+    // Report final P&L when a redemption settles
+    eventBus.on('redemption:complete', ({ marketSlug, won, pnl }) => {
+        riskEngine.recordResult(pnl);
+        logger.info(`[REDEEM] ${marketSlug} settled | ${won ? 'WIN' : 'LOSS'} | pnl=${won ? '+' : ''}$${pnl.toFixed(4)}`);
+    });
+
     logger.success('OneShot Engine running — waiting for dominant side signals...');
 
     if (DEBUG) {
@@ -236,11 +252,13 @@ async function onSignal(evt) {
 
         if (result.status === 'filled') {
             posEngine.open(marketSlug, {
-                tokenId:    bookSide.tokenId,
+                tokenId:     bookSide.tokenId,
                 side,
-                shares:     result.filledSize,
-                entryPrice: result.avgFillPrice || entryPrice,
-                tickSize:   snapshot.tickSize,
+                shares:      result.filledSize,
+                entryPrice:  result.avgFillPrice || entryPrice,
+                tickSize:    snapshot.tickSize,
+                conditionId: snapshot.conditionId,
+                negRisk:     snapshot.negRisk,
             });
             sm.transition(State.POSITION_OPEN, 'fill_confirmed');
             logger.success(
@@ -252,11 +270,13 @@ async function onSignal(evt) {
         } else if (result.status === 'partial' && result.filledSize > 0) {
             // Accept partial fill and hold to expiry
             posEngine.open(marketSlug, {
-                tokenId:    bookSide.tokenId,
+                tokenId:     bookSide.tokenId,
                 side,
-                shares:     result.filledSize,
-                entryPrice: result.avgFillPrice || entryPrice,
-                tickSize:   snapshot.tickSize,
+                shares:      result.filledSize,
+                entryPrice:  result.avgFillPrice || entryPrice,
+                tickSize:    snapshot.tickSize,
+                conditionId: snapshot.conditionId,
+                negRisk:     snapshot.negRisk,
             });
             sm.transition(State.POSITION_OPEN, 'partial_fill_accepted');
             logger.warn(`OneShot: partial fill accepted | ${result.filledSize}/${size} shares | holding to expiry`);
@@ -320,7 +340,7 @@ async function expirePosition(marketSlug, pos) {
     logger.success(
         `OneShot: market EXPIRED | ${marketSlug} | ` +
         `${pos.shares} shares of ${pos.side.toUpperCase()} @ entry $${pos.entryPrice.toFixed(4)} | ` +
-        `pending on-chain redemption`,
+        `queuing for auto-redemption`,
     );
 
     posEngine.closeExpired(marketSlug);
@@ -329,9 +349,19 @@ async function expirePosition(marketSlug, pos) {
         marketSlug,
         exitReason: ReasonCode.EXIT_EXPIRED,
         entryPx:    pos.entryPrice,
-        exitPx:     null,     // unknown until redemption settles
-        pnl:        null,     // settled on-chain by redeemer.js
+        exitPx:     null,   // settled on-chain — see redemption:complete event
+        pnl:        null,
         shares:     pos.shares,
+    });
+
+    // Hand off to RedeemEngine — it will poll until settled and report final P&L
+    redeemEngine.queueRedemption({
+        conditionId: pos.conditionId,
+        marketSlug,
+        side:        pos.side,
+        shares:      pos.shares,
+        entryPrice:  pos.entryPrice,
+        negRisk:     pos.negRisk,
     });
 
     if (sm.canTransitionTo(State.IDLE)) {
@@ -408,6 +438,7 @@ function getOrCreateSM(marketSlug) {
 async function shutdown() {
     logger.warn('OneShot: shutting down...');
     feedService?.stop();
+    redeemEngine?.stop();
 
     // Report any positions still open at shutdown
     const markets = feedService?.activeMarkets ?? [];

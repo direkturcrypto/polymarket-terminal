@@ -41,13 +41,15 @@ export class PositionEngine {
      *
      * @param {string} marketSlug
      * @param {Object} data
-     * @param {string} data.tokenId
+     * @param {string}      data.tokenId
      * @param {'up'|'down'} data.side
-     * @param {number} data.shares
-     * @param {number} data.entryPrice
-     * @param {number} data.tickSize
+     * @param {number}      data.shares
+     * @param {number}      data.entryPrice
+     * @param {number}      data.tickSize
+     * @param {string}      [data.conditionId]  - Required for auto-redemption
+     * @param {boolean}     [data.negRisk]       - Which CTF contract to use for redemption
      */
-    open(marketSlug, { tokenId, side, shares, entryPrice, tickSize }) {
+    open(marketSlug, { tokenId, side, shares, entryPrice, tickSize, conditionId = null, negRisk = false }) {
         this._positions.set(marketSlug, {
             marketSlug,
             tokenId,
@@ -55,6 +57,8 @@ export class PositionEngine {
             shares,
             entryPrice,
             tickSize,
+            conditionId,
+            negRisk,
             openedAt: Date.now(),
         });
     }
@@ -137,11 +141,13 @@ export class PositionEngine {
 
 /**
  * @typedef {Object} PositionState
- * @property {string} marketSlug
- * @property {string} tokenId
+ * @property {string}      marketSlug
+ * @property {string}      tokenId
  * @property {'up'|'down'} side
- * @property {number} shares
- * @property {number} entryPrice
- * @property {number} tickSize
- * @property {number} openedAt
+ * @property {number}      shares
+ * @property {number}      entryPrice
+ * @property {number}      tickSize
+ * @property {string|null} conditionId  - CTF condition ID for on-chain redemption
+ * @property {boolean}     negRisk      - Whether to use NegRisk CTF contract
+ * @property {number}      openedAt
  */
