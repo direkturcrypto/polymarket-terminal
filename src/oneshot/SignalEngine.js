@@ -14,6 +14,7 @@
  */
 
 import { Signal, ReasonCode } from './constants.js';
+import { dbg, DEBUG } from './debug.js';
 
 // ── Score weights ──────────────────────────────────────────────────────────────
 const W_IMBALANCE = 0.35;
@@ -33,6 +34,9 @@ const RETRACE_MID   = 0.35;    // Moderate retrace
 const CONFIRM_SLOPE = 0.0001;  // Minimum positive slope for trend confirmation
 const CONFIRM_RTRC  = 0.30;    // Maximum retrace for trend confirmation
 
+/** Throttle debug output: log gate+score detail every N evaluations per market */
+const DEBUG_EVERY = 5;
+
 export class SignalEngine {
     /**
      * @param {Object} opts
@@ -49,6 +53,9 @@ export class SignalEngine {
         this._tteMin         = tteMin;
         this._tteMax         = tteMax;
 
+        /** Per-market evaluation counter for throttled debug logs */
+        this._evalCount = new Map();
+
         this._eventBus.on('features', (feat) => this._onFeatures(feat));
     }
 
@@ -57,9 +64,30 @@ export class SignalEngine {
     _onFeatures(feat) {
         const { ts, marketSlug, tteSec, up, down, snapshot } = feat;
 
+        // Track evaluation count for throttled debug output
+        const evalN = (this._evalCount.get(marketSlug) ?? 0) + 1;
+        this._evalCount.set(marketSlug, evalN);
+        const logThis = DEBUG && (evalN % DEBUG_EVERY === 1);
+
         // ── Step C: hard gate check ─────────────────────────────────────────
 
         const gate = this._hardGates(snapshot, tteSec);
+
+        if (logThis) {
+            if (!gate.pass) {
+                dbg('GATE',
+                    `${marketSlug} | tte=${tteSec}s | FAIL → ${gate.reason} | ` +
+                    `upSprd=${snapshot.up.spread.toFixed(4)} dnSprd=${snapshot.down.spread.toFixed(4)} ` +
+                    `upBidSz=${snapshot.up.bestBidSize.toFixed(1)} upAskSz=${snapshot.up.bestAskSize.toFixed(1)}`,
+                );
+            } else {
+                dbg('GATE',
+                    `${marketSlug} | tte=${tteSec}s | PASS | ` +
+                    `upSprd=${snapshot.up.spread.toFixed(4)} dnSprd=${snapshot.down.spread.toFixed(4)}`,
+                );
+            }
+        }
+
         if (!gate.pass) {
             this._emit(marketSlug, Signal.NO_TRADE, null, 0, gate.reason, ts, snapshot, feat);
             return;
@@ -67,15 +95,22 @@ export class SignalEngine {
 
         // ── Step D: evaluate each side, pick best qualifying signal ─────────
 
-        const upResult   = this._evaluateSide(up,   snapshot.up);
-        const downResult = this._evaluateSide(down, snapshot.down);
+        const upResult   = this._evaluateSide(up,   snapshot.up,   marketSlug, 'UP',   logThis);
+        const downResult = this._evaluateSide(down, snapshot.down, marketSlug, 'DOWN', logThis);
 
         // Determine which side (if any) qualifies
         const upQual   = upResult.score   >= this._scoreThreshold && upResult.confirmed;
         const downQual = downResult.score >= this._scoreThreshold && downResult.confirmed;
 
+        if (logThis) {
+            dbg('SCORE',
+                `${marketSlug} | threshold=${this._scoreThreshold} | ` +
+                `UP  score=${upResult.score.toFixed(3)} confirmed=${upResult.confirmed} → ${upQual ? 'QUALIFY' : 'skip'} | ` +
+                `DOWN score=${downResult.score.toFixed(3)} confirmed=${downResult.confirmed} → ${downQual ? 'QUALIFY' : 'skip'}`,
+            );
+        }
+
         if (!upQual && !downQual) {
-            // Emit the reason from whichever side had the higher score
             const dominant = upResult.score >= downResult.score ? upResult : downResult;
             const reason   = dominant.confirmed ? ReasonCode.SIG_SCORE_LOW : ReasonCode.SIG_NO_CONFIRM;
             this._emit(marketSlug, Signal.NO_TRADE, null, dominant.score, reason, ts, snapshot, feat);
@@ -96,6 +131,9 @@ export class SignalEngine {
             side   = 'down';
             score  = downResult.score;
         }
+
+        // Always log qualifying entries regardless of throttle
+        dbg('SIGNAL', `>>> ${signal} | ${marketSlug} | score=${score.toFixed(3)} | tte=${tteSec}s`);
 
         this._emit(marketSlug, signal, side, score, null, ts, snapshot, feat);
     }
@@ -129,12 +167,14 @@ export class SignalEngine {
      * Score and confirm one side.
      * @param {Object} sideFeatures  - From FeatureEngine (midSlope6s, imbalance, ...)
      * @param {Object} sideBook      - Current BookSide from snapshot
+     * @param {string} marketSlug    - For debug logs
+     * @param {string} label         - 'UP' or 'DOWN' for debug logs
+     * @param {boolean} logThis      - Whether to emit debug output this tick
      * @returns {{ score: number, confirmed: boolean }}
      */
-    _evaluateSide(sideFeatures, sideBook) {
+    _evaluateSide(sideFeatures, sideBook, marketSlug, label, logThis) {
         const { midSlope6s, retrace3s, imbalance, spread } = sideFeatures;
 
-        // Score components (each 0–1, then weighted)
         const slopeScore     = this._scoreSlope(midSlope6s);
         const imbalanceScore = this._scoreImbalance(imbalance);
         const spreadScore    = this._scoreSpread(spread);
@@ -146,8 +186,18 @@ export class SignalEngine {
             W_SPREAD    * spreadScore    +
             W_RETRACE   * retraceScore;
 
-        // Trend confirmation: positive momentum + low retrace
         const confirmed = midSlope6s > CONFIRM_SLOPE && retrace3s < CONFIRM_RTRC;
+
+        if (logThis) {
+            dbg('FEAT',
+                `${marketSlug} ${label} | ` +
+                `slope=${midSlope6s.toFixed(6)}(s=${slopeScore.toFixed(2)}) ` +
+                `imb=${imbalance.toFixed(3)}(s=${imbalanceScore.toFixed(2)}) ` +
+                `sprd=${spread.toFixed(4)}(s=${spreadScore.toFixed(2)}) ` +
+                `rtrc=${retrace3s.toFixed(3)}(s=${retraceScore.toFixed(2)}) ` +
+                `→ total=${score.toFixed(3)} confirm=${confirmed}`,
+            );
+        }
 
         return { score, confirmed };
     }

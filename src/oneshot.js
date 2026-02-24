@@ -33,6 +33,7 @@ import { RiskEngine }       from './oneshot/RiskEngine.js';
 import { PositionEngine }   from './oneshot/PositionEngine.js';
 import { Telemetry }        from './oneshot/Telemetry.js';
 import { State, Signal, ReasonCode } from './oneshot/constants.js';
+import { DEBUG, dbg } from './oneshot/debug.js';
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 // All values read from .env.  Sensible defaults are provided for optional fields.
@@ -107,6 +108,24 @@ async function main() {
 
     await feedService.start();
     logger.success('OneShot Engine running — waiting for market signals...');
+
+    if (DEBUG) {
+        logger.info('[DBG] Debug mode active. Tags: FEED=discovery/poll, GATE=hard gates, FEAT=features, SCORE=scores, SIGNAL=entry trigger, SM=state changes');
+        // Heartbeat: every 5s log the overall engine status
+        setInterval(() => {
+            const markets = feedService.activeMarkets;
+            const states  = markets.map((slug) => {
+                const sm = stateMachines.get(slug);
+                return `${slug.split('-')[0]}:${sm?.state ?? 'none'}`;
+            }).join(' | ') || '(none)';
+            const risk = riskEngine.stats();
+            dbg('HEART',
+                `active=${markets.length} | states=[${states}] | ` +
+                `dailyPnl=$${risk.dailyPnl.toFixed(4)} | consec=${risk.consecLosses} | ` +
+                `cooldown=${risk.cooldownLeft} | halted=${risk.halted}`,
+            );
+        }, 5_000);
+    }
 
     process.on('SIGINT',  shutdown);
     process.on('SIGTERM', shutdown);

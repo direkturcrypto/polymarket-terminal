@@ -17,11 +17,13 @@
  */
 
 import logger from '../utils/logger.js';
+import { dbg, DEBUG } from './debug.js';
 
-const GAMMA_HOST        = 'https://gamma-api.polymarket.com';
+const GAMMA_HOST         = 'https://gamma-api.polymarket.com';
 const STALE_THRESHOLD_MS = 1500;
-const TOP_N_LEVELS       = 5;   // Levels counted for depth calculation
+const TOP_N_LEVELS       = 5;    // Levels counted for depth calculation
 const DISCOVER_INTERVAL  = 30_000; // Re-scan for new markets every 30s
+const DEBUG_POLL_EVERY   = 10;   // Log a poll summary every N ticks per market (debug only)
 
 export class MarketFeedService {
     /**
@@ -43,8 +45,11 @@ export class MarketFeedService {
         /** @type {Map<string, MarketRecord>} slug → market record */
         this._markets      = new Map();
 
-        this._pollTimer    = null;
+        this._pollTimer     = null;
         this._discoverTimer = null;
+
+        /** Per-market tick counter for throttled debug logs */
+        this._pollCount    = new Map();
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -54,6 +59,7 @@ export class MarketFeedService {
         this._pollTimer     = setInterval(() => this._tick().catch(() => {}), this._pollMs);
         this._discoverTimer = setInterval(() => this._discoverMarkets().catch(() => {}), DISCOVER_INTERVAL);
         logger.info(`MarketFeedService: started | assets=[${this._assets}] interval=${this._pollMs}ms`);
+        if (DEBUG) logger.info('[DBG:FEED] Debug mode ON — verbose feed logging enabled');
     }
 
     stop() {
@@ -78,21 +84,41 @@ export class MarketFeedService {
             this._slotTs() + durationMin * 60,
         ];
 
+        dbg('FEED', `--- discovery cycle | probing ${this._assets.length * slots.length} slug(s) ---`);
+
         for (const asset of this._assets) {
             for (const slotTs of slots) {
                 const slug = `${asset}-updown-${this._duration}-${slotTs}`;
-                if (this._markets.has(slug)) continue;
+
+                if (this._markets.has(slug)) {
+                    dbg('FEED', `  ${slug} → already tracked, skip`);
+                    continue;
+                }
+
+                dbg('FEED', `  probing ${slug} ...`);
 
                 try {
                     const market = await this._fetchMarketBySlug(slug);
-                    if (!market) continue;
+
+                    if (!market) {
+                        dbg('FEED', `  ${slug} → not found on Gamma API`);
+                        continue;
+                    }
 
                     const endTs = this._parseEndTs(market);
-                    if (!endTs || Date.now() >= endTs) continue;
+                    if (!endTs) {
+                        dbg('FEED', `  ${slug} → found but endTs unparseable`);
+                        continue;
+                    }
+                    if (Date.now() >= endTs) {
+                        dbg('FEED', `  ${slug} → found but already expired`);
+                        continue;
+                    }
 
                     const { upTokenId, downTokenId } = this._extractTokenIds(market);
                     if (!upTokenId || !downTokenId) {
                         logger.warn(`MarketFeedService: could not extract token IDs for ${slug}`);
+                        dbg('FEED', `  tokens shape: ${JSON.stringify(Object.keys(market).slice(0, 10))}`);
                         continue;
                     }
 
@@ -110,19 +136,28 @@ export class MarketFeedService {
 
                     const secLeft = Math.floor((endTs - Date.now()) / 1000);
                     logger.success(`MarketFeedService: tracking ${slug} (closes in ${secLeft}s)`);
+                    dbg('FEED', `  upToken=${upTokenId.slice(0, 12)}... downToken=${downTokenId.slice(0, 12)}... tick=${tickSize}`);
 
-                } catch {
+                } catch (err) {
+                    dbg('FEED', `  ${slug} → discovery error: ${err.message}`);
                     // Network blip — will retry on next discovery cycle
                 }
             }
         }
 
-        // Prune expired markets (add a 5s grace period for final snapshots)
+        // Prune expired markets (5s grace period for final snapshots)
         for (const [slug, mkt] of this._markets) {
             if (Date.now() > mkt.endTs + 5_000) {
                 this._markets.delete(slug);
+                this._pollCount.delete(slug);
                 logger.info(`MarketFeedService: pruned expired market ${slug}`);
             }
+        }
+
+        if (this._markets.size === 0) {
+            dbg('FEED', 'No active markets found — will retry in 30s');
+        } else {
+            dbg('FEED', `Active markets: [${[...this._markets.keys()].join(', ')}]`);
         }
     }
 
@@ -185,6 +220,8 @@ export class MarketFeedService {
     // ── Book polling ──────────────────────────────────────────────────────────
 
     async _tick() {
+        if (this._markets.size === 0) return;
+
         for (const [, mkt] of this._markets) {
             const tteSec = Math.floor((mkt.endTs - Date.now()) / 1000);
             if (tteSec <= 0) continue;
@@ -203,8 +240,29 @@ export class MarketFeedService {
                 const snapshot = this._buildSnapshot(mkt, upBook, downBook, tteSec, stale);
                 this._eventBus.emit('snapshot', snapshot);
 
-            } catch {
-                // Silent — stale snapshot will suppress entry via gate check
+                // ── Debug: throttled poll summary (every N ticks) ─────────────
+                if (DEBUG) {
+                    const count = (this._pollCount.get(mkt.slug) ?? 0) + 1;
+                    this._pollCount.set(mkt.slug, count);
+
+                    if (count % DEBUG_POLL_EVERY === 1) {
+                        const u = snapshot.up;
+                        const d = snapshot.down;
+                        const staleFlag = stale ? ' [STALE]' : '';
+                        dbg('POLL',
+                            `${mkt.slug} | tte=${tteSec}s | fetchMs=${fetchMs}ms${staleFlag}\n` +
+                            `         UP   bid=${u.bestBid.toFixed(4)}/ask=${u.bestAsk.toFixed(4)} ` +
+                                `spread=${u.spread.toFixed(4)} mid=${u.mid.toFixed(4)} ` +
+                                `depthBid=${u.depthBid.toFixed(1)} depthAsk=${u.depthAsk.toFixed(1)}\n` +
+                            `         DOWN bid=${d.bestBid.toFixed(4)}/ask=${d.bestAsk.toFixed(4)} ` +
+                                `spread=${d.spread.toFixed(4)} mid=${d.mid.toFixed(4)} ` +
+                                `depthBid=${d.depthBid.toFixed(1)} depthAsk=${d.depthAsk.toFixed(1)}`,
+                        );
+                    }
+                }
+
+            } catch (err) {
+                dbg('POLL', `${mkt.slug} → poll error: ${err.message}`);
             }
         }
     }
@@ -240,7 +298,7 @@ export class MarketFeedService {
             : (bestBid || bestAsk || 0.5);
         const spread   = Math.max(0, bestAsk - bestBid);
 
-        const topN    = Math.min(TOP_N_LEVELS, Math.max(bids.length, asks.length));
+        const topN     = Math.min(TOP_N_LEVELS, Math.max(bids.length, asks.length));
         const depthBid = bids.slice(0, topN).reduce((s, l) => s + l.size, 0);
         const depthAsk = asks.slice(0, topN).reduce((s, l) => s + l.size, 0);
 
