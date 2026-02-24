@@ -1,4 +1,10 @@
 node_modules/
 .env
-data/*.json
+data/
 .DS_Store
+coverage/
+dist/
+.next/
+.turbo/
+**/.next/
+**/.turbo/
