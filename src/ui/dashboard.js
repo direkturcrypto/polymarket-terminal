@@ -9,11 +9,13 @@ let active    = false;
 
 
 export function initDashboard() {
+    const isWindows = process.platform === 'win32';
     screen = blessed.screen({
         smartCSR: false,   // avoid complex cursor escape sequences
         title: 'Polymarket Copy Trade',
-        fullUnicode: true,
-        forceUnicode: true,
+        fullUnicode: !isWindows,  // Windows often uses non-UTF-8 codepage; set chcp 65001 if you need unicode
+        forceUnicode: !isWindows,
+        ...(isWindows && { terminal: 'windows-ansi' }),  // better border/ACS behavior on Windows
     });
 
     // ── Left panel: event log (60%) ────────────────────────────

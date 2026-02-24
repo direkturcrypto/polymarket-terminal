@@ -52,6 +52,7 @@
 | Requirement | Details |
 |---|---|
 | Node.js | v18 or higher (ESM support required) |
+| Windows | See [WINDOWS.md](WINDOWS.md) for setup and known issues. |
 | Polygon Wallet | An EOA wallet with a private key |
 | Polymarket Proxy Wallet | Your proxy wallet address (visible on your Polymarket profile → Deposit) |
 | USDC.e on Polygon | Deposited via Polymarket's deposit flow |
@@ -70,7 +71,7 @@ cd polymarket-terminal
 npm install
 
 # 3. Copy the environment template
-cp .env.example .env
+cp .env.example .env   # Windows: copy .env.example .env
 
 # 4. Fill in your credentials (see Configuration section below)
 nano .env   # or use your preferred editor

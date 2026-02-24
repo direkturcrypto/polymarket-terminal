@@ -9,8 +9,20 @@ import { initDashboard, appendLog, updateStatus } from './ui/dashboard.js';
 import logger from './utils/logger.js';
 
 // ── Dashboard init (before any log output) ────────────────────────────────────
-initDashboard();
-logger.setOutput(appendLog);
+// On some Windows setups the blessed TUI can render as a blank screen.
+// Allow disabling the dashboard with NO_TUI=true or HEADLESS=true in .env.
+const useDashboard = process.env.NO_TUI !== 'true' && process.env.HEADLESS !== 'true';
+
+if (useDashboard) {
+    try {
+        initDashboard();
+        logger.setOutput(appendLog);
+    } catch (err) {
+        // Fall back to plain stdout logging if TUI fails
+        // eslint-disable-next-line no-console
+        console.error('Failed to initialize dashboard, running in headless mode:', err.message);
+    }
+}
 
 // ── Handle a trade event from WebSocket ───────────────────────────────────────
 async function handleTrade(trade) {

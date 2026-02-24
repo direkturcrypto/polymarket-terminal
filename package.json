@@ -7,12 +7,12 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon --ignore 'data/*.json' src/index.js",
-    "mm": "DRY_RUN=false node src/mm.js",
-    "mm-sim": "DRY_RUN=true node src/mm.js",
-    "mm-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/mm.js",
-    "sniper": "DRY_RUN=false node src/sniper.js",
-    "sniper-sim": "DRY_RUN=true node src/sniper.js",
-    "sniper-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper.js"
+    "mm": "cross-env DRY_RUN=false node src/mm.js",
+    "mm-sim": "cross-env DRY_RUN=true node src/mm.js",
+    "mm-dev": "cross-env DRY_RUN=true nodemon --ignore 'data/*.json' src/mm.js",
+    "sniper": "cross-env DRY_RUN=false node src/sniper.js",
+    "sniper-sim": "cross-env DRY_RUN=true node src/sniper.js",
+    "sniper-dev": "cross-env DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper.js"
   },
   "keywords": [
     "polymarket",
@@ -22,13 +22,14 @@
   "author": "direkturcrypto",
   "license": "ISC",
   "dependencies": {
-    "@polymarket/clob-client": "^4.7.3",
+    "@polymarket/clob-client": "^5.2.4",
     "blessed": "^0.1.81",
     "dotenv": "^16.4.7",
-    "ethers": "^5.8.0",
+    "ethers": "^6.16.0",
     "ws": "^8.19.0"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "nodemon": "^3.1.9"
   }
 }

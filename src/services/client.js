@@ -14,6 +14,10 @@ export async function initClient() {
     logger.info('Initializing Polymarket CLOB client...');
 
     signer = new Wallet(config.privateKey);
+    // Support both ethers v5 and v6: older @polymarket/clob-client expects _signTypedData
+    if (typeof signer._signTypedData !== 'function' && typeof signer.signTypedData === 'function') {
+        signer._signTypedData = (...args) => signer.signTypedData(...args);
+    }
     logger.info(`EOA (signer)  : ${signer.address}`);
     logger.info(`Proxy wallet  : ${config.proxyWallet}`);
 
@@ -71,8 +75,15 @@ export function getSigner() {
  * Get a working Polygon provider using RPC from config
  */
 export async function getPolygonProvider() {
-    const { ethers } = await import('ethers');
-    const provider = new ethers.providers.JsonRpcProvider(config.polygonRpcUrl);
+    const mod = await import('ethers');
+    // Support both ethers v5 (namespace export) and v6 (named exports)
+    const ethersNS = mod.ethers || mod; // v5: mod.ethers, v6: mod
+    const ProviderCtor =
+        (ethersNS.providers && ethersNS.providers.JsonRpcProvider) || mod.JsonRpcProvider;
+    if (!ProviderCtor) {
+        throw new Error('Could not find JsonRpcProvider on ethers module');
+    }
+    const provider = new ProviderCtor(config.polygonRpcUrl);
     return provider;
 }
 
@@ -80,11 +91,14 @@ export async function getPolygonProvider() {
  * Get USDC.e balance of the proxy wallet on Polygon
  */
 export async function getUsdcBalance() {
-    const { ethers } = await import('ethers');
+    const mod = await import('ethers');
+    const ethersNS = mod.ethers || mod; // v5: mod.ethers, v6: mod
     const provider = await getPolygonProvider();
     const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e on Polygon
     const abi = ['function balanceOf(address) view returns (uint256)'];
-    const usdc = new ethers.Contract(usdcAddress, abi, provider);
+    const ContractCtor = ethersNS.Contract || mod.Contract;
+    const formatUnits = (ethersNS.utils && ethersNS.utils.formatUnits) || mod.formatUnits;
+    const usdc = new ContractCtor(usdcAddress, abi, provider);
     const balance = await usdc.balanceOf(config.proxyWallet);
-    return parseFloat(ethers.utils.formatUnits(balance, 6));
+    return parseFloat(formatUnits(balance, 6));
 }
