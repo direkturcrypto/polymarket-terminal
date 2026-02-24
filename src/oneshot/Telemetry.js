@@ -77,9 +77,11 @@ export class Telemetry {
     logExit(d) {
         this._write({ type: 'exit', ...d });
 
-        const pnlStr = d.pnl >= 0
-            ? `+$${d.pnl.toFixed(4)}`
-            : `-$${Math.abs(d.pnl).toFixed(4)}`;
+        const pnlStr = d.pnl == null
+            ? 'pending(on-chain)'
+            : d.pnl >= 0
+                ? `+$${d.pnl.toFixed(4)}`
+                : `-$${Math.abs(d.pnl).toFixed(4)}`;
 
         logger.money(`[Telemetry] exit ${d.marketSlug} | ${d.exitReason} | pnl=${pnlStr}`);
     }
