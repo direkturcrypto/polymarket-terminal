@@ -172,13 +172,14 @@ export class RedeemEngine {
             // Simulate: just log the outcome without touching the chain
             this._logSettlement(item, won, pnl, received, cost);
         } else {
-            // Real redemption: submit on-chain tx
+            // Always attempt redeemPositions — even for losses (burns the token, cleans wallet)
             const success = await this._executeRedeem(item);
-            if (!success) {
-                // tx failed — keep in queue, retry on next poll
+            if (!success && won) {
+                // Win but tx failed — USDC unclaimed, keep in queue and retry next poll
                 logger.warn(`RedeemEngine: redemption tx failed for ${item.marketSlug} — will retry`);
                 return;
             }
+            // Loss: clear from queue regardless of tx result — payout is 0, nothing to collect
             this._logSettlement(item, won, pnl, received, cost);
         }
 
