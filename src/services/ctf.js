@@ -409,6 +409,28 @@ export async function cleanupOpenPositions(clobClient) {
     }
 }
 
+// ── Single-position redeemer (used by OneShot RedeemEngine) ──────────────────
+
+/**
+ * Redeem a single resolved position through the Gnosis Safe proxy wallet.
+ * Uses the same execSafeCall path as all other MM on-chain operations,
+ * enforcing the 30 Gwei priority fee floor required by Polygon.
+ *
+ * @param {string}  conditionId - bytes32 condition ID
+ * @param {boolean} negRisk     - use NegRisk CTF address if true
+ */
+export async function redeemPosition(conditionId, negRisk = false) {
+    const ctfAddress = negRisk ? NEG_RISK_EXCHANGE : CTF_ADDRESS;
+    const ctfIface   = new ethers.utils.Interface(CTF_ABI);
+    const data = ctfIface.encodeFunctionData('redeemPositions', [
+        USDC_ADDRESS,
+        ethers.constants.HashZero,
+        conditionId,
+        [1, 2],
+    ]);
+    await execSafeCall(ctfAddress, data, `redeemPositions ${conditionId.slice(0, 12)}...`);
+}
+
 // ── Periodic redeemer ─────────────────────────────────────────────────────────
 
 /**

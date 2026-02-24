@@ -22,19 +22,14 @@
  */
 
 import { ethers } from 'ethers';
-import config from '../config/index.js';
 import logger from '../utils/logger.js';
 import { getPolygonProvider } from '../services/client.js';
+import { redeemPosition, CTF_ADDRESS } from '../services/ctf.js';
 import { dbg } from './debug.js';
 
-// ── On-chain constants ────────────────────────────────────────────────────────
-
-const CTF_ADDRESS          = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
-const NEG_RISK_CTF_ADDRESS = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
-const USDC_ADDRESS         = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+// ── On-chain constants (read-only — no writes go through EOA) ─────────────────
 
 const CTF_ABI = [
-    'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)',
     'function payoutNumerators(bytes32 conditionId, uint256 outcomeIndex) view returns (uint256)',
     'function payoutDenominator(bytes32 conditionId) view returns (uint256)',
 ];
@@ -258,28 +253,13 @@ export class RedeemEngine {
         }
     }
 
-    /** Submit redeemPositions() transaction on Polygon */
+    /** Submit redeemPositions() via Gnosis Safe proxy wallet (same path as MM) */
     async _executeRedeem(item) {
         try {
-            const provider   = await getPolygonProvider();
-            const wallet     = new ethers.Wallet(config.privateKey, provider);
-            const ctfAddress = item.negRisk ? NEG_RISK_CTF_ADDRESS : CTF_ADDRESS;
-            const ctf        = new ethers.Contract(ctfAddress, CTF_ABI, wallet);
-
             logger.info(`RedeemEngine: submitting redeem tx | ${item.marketSlug}...`);
-
-            const tx = await ctf.redeemPositions(
-                USDC_ADDRESS,
-                ethers.constants.HashZero,   // parentCollectionId = 0x000...
-                item.conditionId,
-                [1, 2],                      // indexSets: claim both outcomes (CTF discards the losing side)
-            );
-
-            logger.info(`RedeemEngine: tx submitted | hash=${tx.hash}`);
-            const receipt = await tx.wait();
-            logger.success(`RedeemEngine: confirmed | block=${receipt.blockNumber} | ${item.marketSlug}`);
+            await redeemPosition(item.conditionId, item.negRisk);
+            logger.success(`RedeemEngine: redeemed | ${item.marketSlug}`);
             return true;
-
         } catch (err) {
             logger.error(`RedeemEngine: tx error | ${item.marketSlug} — ${err.message}`);
             return false;
