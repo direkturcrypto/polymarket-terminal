@@ -27,7 +27,9 @@ export const ReasonCode = Object.freeze({
 
     // Signal evaluation failures
     SIG_SCORE_LOW:          'SIG_SCORE_LOW',          // Composite score below threshold
-    SIG_NO_CONFIRM:         'SIG_NO_CONFIRM',         // Trend confirmation failed
+    SIG_NO_CONFIRM:         'SIG_NO_CONFIRM',         // Trend confirmation failed (legacy)
+    SIG_NO_DOMINANT:        'SIG_NO_DOMINANT',        // Neither side is clearly dominant (mid gap too small)
+    SIG_LOW_DOMINANT:       'SIG_LOW_DOMINANT',       // Dominant side mid below minimum threshold
 
     // Execution failures
     EXEC_TIMEOUT_NO_FILL:   'EXEC_TIMEOUT_NO_FILL',   // FOK timed out without fill
@@ -40,11 +42,8 @@ export const ReasonCode = Object.freeze({
     RISK_STATE_BLOCK:       'RISK_STATE_BLOCK',       // Risk engine blocked entry (cooldown/halted)
 
     // Exit reasons
-    EXIT_TP_HIT:            'EXIT_TP_HIT',            // Take-profit price reached
-    EXIT_TIME_FLATTEN:      'EXIT_TIME_FLATTEN',      // Hard flatten at TTE <= 12s
-    EXIT_TIME_REDUCE:       'EXIT_TIME_REDUCE',       // Reduce-only mode at TTE <= 20s
-    EXIT_ADVERSE_MOVE:      'EXIT_ADVERSE_MOVE',      // Mid dropped >= 2 ticks from entry
-    EXIT_SLOPE_DROP:        'EXIT_SLOPE_DROP',        // Slope <= 0 sustained for 4s
+    EXIT_ADVERSE_MOVE:      'EXIT_ADVERSE_MOVE',      // Token mid collapsed below stop-loss floor
+    EXIT_EXPIRED:           'EXIT_EXPIRED',           // Market expired — position pending on-chain redemption
     EXIT_RISK_FORCED:       'EXIT_RISK_FORCED',       // Risk engine forced exit
 });
 

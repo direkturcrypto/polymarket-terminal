@@ -1,21 +1,23 @@
 /**
  * src/oneshot.js
- * Anti-Flip 5m OneShot Engine — main orchestrator entry point.
+ * Dominant Side Hold Engine — main orchestrator entry point.
  *
- * Wires all seven engine services together via the central EventBus and
- * manages a per-market StateMachine lifecycle.
+ * Strategy: enter the probable winner (dominant side, mid >= minDominantMid),
+ * hold the position until the market expires, then let redeemer.js claim
+ * the on-chain payout.  There are no take-profit sells or momentum-based exits.
  *
  * Runtime sequence (per market, per tick):
  *   A → MarketFeedService emits 'snapshot'
  *   B → FeatureEngine processes snapshot, emits 'features'
- *   C+D → SignalEngine evaluates gates + score, emits 'signal'
- *   E → Orchestrator submits order on ENTER signal
+ *   C+D → SignalEngine evaluates gates + dominant side, emits 'signal'
+ *   E → Orchestrator submits FOK buy on ENTER signal
  *   F → Fill handling (full / partial / timeout)
  *   G → PositionEngine evaluates exit on each snapshot
- *   H → RiskEngine updated on every close
+ *   H → RiskEngine updated on emergency exits only
  *
  * State machine (per market):
- *   IDLE → SETUP_READY → ORDER_PENDING → POSITION_OPEN → REDUCE_ONLY → IDLE
+ *   IDLE → SETUP_READY → ORDER_PENDING → POSITION_OPEN → IDLE (expired)
+ *   POSITION_OPEN → IDLE (emergency stop-loss exit)
  *   ANY → COOLDOWN → IDLE
  *   ANY → HALTED  (terminal for the session)
  */
@@ -36,21 +38,23 @@ import { State, Signal, ReasonCode } from './oneshot/constants.js';
 import { DEBUG, dbg } from './oneshot/debug.js';
 
 // ── Configuration ──────────────────────────────────────────────────────────────
-// All values read from .env.  Sensible defaults are provided for optional fields.
 
 const cfg = {
-    assets:          (process.env.ONESHOT_ASSETS        || 'btc').split(',').map((s) => s.trim().toLowerCase()),
-    duration:         process.env.ONESHOT_DURATION       || '5m',
-    baseRiskUsdc:    parseFloat(process.env.ONESHOT_BASE_RISK_USDC   || '5'),
-    tpTicks:         parseInt(process.env.ONESHOT_TP_TICKS           || '1',  10),
-    scoreThreshold:  parseFloat(process.env.ONESHOT_SCORE_THRESHOLD  || '0.60'),
-    pollIntervalMs:  parseInt(process.env.ONESHOT_POLL_INTERVAL_MS   || '300', 10),
-    minTopSize:      parseFloat(process.env.ONESHOT_MIN_TOP_SIZE      || '10'),
-    maxConsecLosses: parseInt(process.env.ONESHOT_MAX_CONSEC_LOSSES  || '2',  10),
-    cooldownRounds:  parseInt(process.env.ONESHOT_COOLDOWN_ROUNDS    || '3',  10),
-    dailyLossCap:    parseFloat(process.env.ONESHOT_DAILY_LOSS_CAP   || '20'),
-    fillTimeoutMs:   parseInt(process.env.ONESHOT_FILL_TIMEOUT_MS    || '800', 10),
-    dryRun:          process.env.DRY_RUN !== 'false',
+    assets:           (process.env.ONESHOT_ASSETS         || 'btc').split(',').map((s) => s.trim().toLowerCase()),
+    duration:          process.env.ONESHOT_DURATION        || '5m',
+    baseRiskUsdc:     parseFloat(process.env.ONESHOT_BASE_RISK_USDC    || '5'),
+    minDominantMid:   parseFloat(process.env.ONESHOT_MIN_DOMINANT_MID  || '0.60'),
+    stopLossMid:      parseFloat(process.env.ONESHOT_STOP_LOSS_MID     || '0.20'),
+    scoreThreshold:   parseFloat(process.env.ONESHOT_SCORE_THRESHOLD   || '0.55'),
+    pollIntervalMs:   parseInt(process.env.ONESHOT_POLL_INTERVAL_MS    || '300',  10),
+    minTopSize:       parseFloat(process.env.ONESHOT_MIN_TOP_SIZE      || '10'),
+    tteMin:           parseInt(process.env.ONESHOT_TTE_MIN             || '20',   10),
+    tteMax:           parseInt(process.env.ONESHOT_TTE_MAX             || '90',   10),
+    maxConsecLosses:  parseInt(process.env.ONESHOT_MAX_CONSEC_LOSSES   || '2',    10),
+    cooldownRounds:   parseInt(process.env.ONESHOT_COOLDOWN_ROUNDS     || '3',    10),
+    dailyLossCap:     parseFloat(process.env.ONESHOT_DAILY_LOSS_CAP    || '20'),
+    fillTimeoutMs:    parseInt(process.env.ONESHOT_FILL_TIMEOUT_MS     || '800',  10),
+    dryRun:           process.env.DRY_RUN !== 'false',
 };
 
 // ── Per-market state ───────────────────────────────────────────────────────────
@@ -71,33 +75,42 @@ let telemetry;
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 async function main() {
-    logger.success('=== OneShot Anti-Flip Engine starting ===');
+    logger.success('=== OneShot Dominant Side Hold Engine starting ===');
     logger.info(`Assets: [${cfg.assets}] | Duration: ${cfg.duration} | DRY_RUN: ${cfg.dryRun}`);
-    logger.info(`Risk: baseRisk=$${cfg.baseRiskUsdc} | tpTicks=${cfg.tpTicks} | scoreMin=${cfg.scoreThreshold}`);
+    logger.info(
+        `Strategy: enter dominant side (mid >= ${cfg.minDominantMid}) | ` +
+        `TTE window: ${cfg.tteMin}–${cfg.tteMax}s | hold to expiry`,
+    );
+    logger.info(
+        `Risk: baseRisk=$${cfg.baseRiskUsdc} | stopLoss=${cfg.stopLossMid > 0 ? cfg.stopLossMid : 'disabled'} | ` +
+        `scoreMin=${cfg.scoreThreshold}`,
+    );
 
     await initClient();
     const client = getClient();
 
-    // Initialise all services
     telemetry    = new Telemetry();
     riskEngine   = new RiskEngine({
         maxConsecLosses: cfg.maxConsecLosses,
         cooldownRounds:  cfg.cooldownRounds,
         dailyLossCap:    cfg.dailyLossCap,
     });
-    posEngine    = new PositionEngine({ tpTicks: cfg.tpTicks });
+    posEngine    = new PositionEngine({ stopLossMid: cfg.stopLossMid });
     execEngine   = new ExecutionEngine({ client, dryRun: cfg.dryRun, fillTimeoutMs: cfg.fillTimeoutMs });
     featureEngine = new FeatureEngine({ eventBus });
     signalEngine  = new SignalEngine({
         eventBus,
-        scoreThreshold: cfg.scoreThreshold,
-        minTopSize:     cfg.minTopSize,
+        scoreThreshold:  cfg.scoreThreshold,
+        minTopSize:      cfg.minTopSize,
+        minDominantMid:  cfg.minDominantMid,
+        tteMin:          cfg.tteMin,
+        tteMax:          cfg.tteMax,
     });
     feedService  = new MarketFeedService({
         client,
-        assets:          cfg.assets,
-        duration:        cfg.duration,
-        pollIntervalMs:  cfg.pollIntervalMs,
+        assets:         cfg.assets,
+        duration:       cfg.duration,
+        pollIntervalMs: cfg.pollIntervalMs,
         eventBus,
     });
 
@@ -107,11 +120,13 @@ async function main() {
     eventBus.on('state:transition', onStateTransition);
 
     await feedService.start();
-    logger.success('OneShot Engine running — waiting for market signals...');
+    logger.success('OneShot Engine running — waiting for dominant side signals...');
 
     if (DEBUG) {
-        logger.info('[DBG] Debug mode active. Tags: FEED=discovery/poll, GATE=hard gates, FEAT=features, SCORE=scores, SIGNAL=entry trigger, SM=state changes');
-        // Heartbeat: every 5s log the overall engine status
+        logger.info(
+            '[DBG] Debug mode active. Tags: FEED=discovery/poll, GATE=hard gates, ' +
+            'SCORE=dominant side scoring, SIGNAL=entry trigger, SM=state changes, HEART=heartbeat',
+        );
         setInterval(() => {
             const markets = feedService.activeMarkets;
             const states  = markets.map((slug) => {
@@ -133,10 +148,6 @@ async function main() {
 
 // ── Signal handler (Steps C/D/E/F) ───────────────────────────────────────────
 
-/**
- * Process a signal emitted by SignalEngine.
- * Coordinates state transitions and order submission for the target market.
- */
 async function onSignal(evt) {
     const { marketSlug, signal, side, score, reason, snapshot, features } = evt;
 
@@ -161,10 +172,11 @@ async function onSignal(evt) {
 
     if (signal === Signal.NO_TRADE) return;
 
-    // Only enter from IDLE
+    // Only enter from IDLE — one position per market slot
     if (!sm.is(State.IDLE)) return;
 
-    // ── Step H pre-check: risk gate ────────────────────────────────────────
+    // ── Risk gate ─────────────────────────────────────────────────────────
+
     const riskCheck = riskEngine.canTrade();
 
     if (!riskCheck.ok) {
@@ -177,16 +189,17 @@ async function onSignal(evt) {
     }
 
     // ── Step E: order submission ───────────────────────────────────────────
+
     const bookSide   = side === 'up' ? snapshot.up : snapshot.down;
     const entryPrice = bookSide.bestAsk;
 
-    // Size per spec: floor(baseRiskUSDC / entryPrice), clamped to ≥ 5 shares
+    // Size: floor(baseRiskUSDC / entryPrice), minimum 5 shares
     const rawSize = cfg.baseRiskUsdc / entryPrice;
     const size    = Math.max(5, Math.floor(rawSize));
 
     logger.trade(
         `OneShot ENTER | ${signal} | ${marketSlug} | ` +
-        `px=$${entryPrice} | size=${size} | score=${score.toFixed(3)} | tte=${snapshot.tteSec}s`,
+        `mid=${bookSide.mid.toFixed(4)} px=$${entryPrice} | size=${size} | score=${score.toFixed(3)} | tte=${snapshot.tteSec}s`,
     );
 
     sm.transition(State.SETUP_READY, 'signal_passed');
@@ -201,7 +214,6 @@ async function onSignal(evt) {
             marketSlug,
         });
 
-        // Log order lifecycle
         telemetry.logOrder({
             clientOrderId: result.orderId,
             side:          signal,
@@ -214,6 +226,7 @@ async function onSignal(evt) {
         });
 
         // ── Step F: fill handling ──────────────────────────────────────────
+
         if (result.status === 'filled') {
             posEngine.open(marketSlug, {
                 tokenId:    bookSide.tokenId,
@@ -225,35 +238,23 @@ async function onSignal(evt) {
             sm.transition(State.POSITION_OPEN, 'fill_confirmed');
             logger.success(
                 `OneShot: position OPEN | ${marketSlug} | ` +
-                `${result.filledSize} shares @ $${(result.avgFillPrice || entryPrice).toFixed(4)}`,
+                `${result.filledSize} shares @ $${(result.avgFillPrice || entryPrice).toFixed(4)} | ` +
+                `holding to expiry`,
             );
 
         } else if (result.status === 'partial' && result.filledSize > 0) {
-            if (snapshot.tteSec <= 25) {
-                // Immediate reduce-only: close the partial fill right away
-                logger.warn(`OneShot: partial fill + low TTE (${snapshot.tteSec}s) — reducing immediately`);
-                await execEngine.submitSell({
-                    tokenId:    bookSide.tokenId,
-                    size:       result.filledSize,
-                    price:      bookSide.bestBid,
-                    marketSlug,
-                });
-                sm.transition(State.IDLE, ReasonCode.EXEC_PARTIAL_REDUCE);
-            } else {
-                // Accept partial and manage as a smaller position
-                posEngine.open(marketSlug, {
-                    tokenId:    bookSide.tokenId,
-                    side,
-                    shares:     result.filledSize,
-                    entryPrice: result.avgFillPrice || entryPrice,
-                    tickSize:   snapshot.tickSize,
-                });
-                sm.transition(State.POSITION_OPEN, 'partial_fill_accepted');
-                logger.warn(`OneShot: partial fill accepted | ${result.filledSize}/${size} shares`);
-            }
+            // Accept partial fill and hold to expiry
+            posEngine.open(marketSlug, {
+                tokenId:    bookSide.tokenId,
+                side,
+                shares:     result.filledSize,
+                entryPrice: result.avgFillPrice || entryPrice,
+                tickSize:   snapshot.tickSize,
+            });
+            sm.transition(State.POSITION_OPEN, 'partial_fill_accepted');
+            logger.warn(`OneShot: partial fill accepted | ${result.filledSize}/${size} shares | holding to expiry`);
 
         } else {
-            // FOK timed out or was cancelled
             logger.warn(`OneShot: no fill on ${marketSlug} — returning to IDLE`);
             sm.transition(State.IDLE, ReasonCode.EXEC_TIMEOUT_NO_FILL);
         }
@@ -268,57 +269,81 @@ async function onSignal(evt) {
 
 // ── Position management handler (Step G) ──────────────────────────────────────
 
-/**
- * Called on every snapshot tick.
- * If the market has an open position, evaluates exit conditions and
- * coordinates exits through ExecutionEngine.
- */
 async function onSnapshotForPositionMgmt(snapshot) {
     const { marketSlug, tteSec } = snapshot;
     const sm = stateMachines.get(marketSlug);
     if (!sm) return;
 
-    // Remove state machines for fully expired markets
-    if (tteSec <= 0 && sm.is(State.IDLE)) {
+    // Clean up state machines for fully expired markets with no open position
+    if (tteSec < -10 && sm.is(State.IDLE)) {
         stateMachines.delete(marketSlug);
         return;
     }
 
-    if (!sm.is(State.POSITION_OPEN) && !sm.is(State.REDUCE_ONLY)) return;
+    if (!sm.is(State.POSITION_OPEN)) return;
 
     const pos = posEngine.getPosition(marketSlug);
     if (!pos) {
-        // Position state is gone but SM isn't — recover gracefully
         if (sm.canTransitionTo(State.IDLE)) sm.transition(State.IDLE, 'position_missing');
         return;
     }
 
-    const features   = featureEngine.getLatest(marketSlug);
-    const bookSide   = pos.side === 'up' ? snapshot.up : snapshot.down;
-
     // Evaluate exit conditions
-    const exitResult = posEngine.evaluateExit(marketSlug, snapshot, features);
+    const exitResult = posEngine.evaluateExit(marketSlug, snapshot);
 
-    // Transition to REDUCE_ONLY when TTE window triggers
-    if (exitResult.isReduceOnly && sm.is(State.POSITION_OPEN)) {
-        sm.transition(State.REDUCE_ONLY, ReasonCode.EXIT_TIME_REDUCE);
+    // Market expired — position goes to on-chain redeemer
+    if (exitResult.isExpired) {
+        await expirePosition(marketSlug, pos);
+        return;
     }
 
-    // Execute exit if required
+    // Emergency stop-loss (catastrophic market reversal)
     if (exitResult.shouldExit) {
+        const bookSide = pos.side === 'up' ? snapshot.up : snapshot.down;
         await flattenPosition(marketSlug, pos, bookSide, exitResult.reason, snapshot);
     }
 }
 
-// ── Flatten helper ────────────────────────────────────────────────────────────
+// ── Expire helper (market closed, pending on-chain redemption) ────────────────
+
+async function expirePosition(marketSlug, pos) {
+    const sm = stateMachines.get(marketSlug);
+    if (!sm) return;
+
+    logger.success(
+        `OneShot: market EXPIRED | ${marketSlug} | ` +
+        `${pos.shares} shares of ${pos.side.toUpperCase()} @ entry $${pos.entryPrice.toFixed(4)} | ` +
+        `pending on-chain redemption`,
+    );
+
+    posEngine.closeExpired(marketSlug);
+
+    telemetry.logExit({
+        marketSlug,
+        exitReason: ReasonCode.EXIT_EXPIRED,
+        entryPx:    pos.entryPrice,
+        exitPx:     null,     // unknown until redemption settles
+        pnl:        null,     // settled on-chain by redeemer.js
+        shares:     pos.shares,
+    });
+
+    if (sm.canTransitionTo(State.IDLE)) {
+        sm.transition(State.IDLE, ReasonCode.EXIT_EXPIRED);
+    }
+}
+
+// ── Emergency flatten helper (adverse-move stop-loss only) ────────────────────
 
 async function flattenPosition(marketSlug, pos, bookSide, reason, snapshot) {
     const sm = stateMachines.get(marketSlug);
-    if (!sm || (!sm.is(State.POSITION_OPEN) && !sm.is(State.REDUCE_ONLY))) return;
+    if (!sm || !sm.is(State.POSITION_OPEN)) return;
 
     const exitPrice = bookSide.bestBid;
 
-    logger.warn(`OneShot: flattening ${marketSlug} | reason=${reason} | exitPx=$${exitPrice}`);
+    logger.warn(
+        `OneShot: EMERGENCY EXIT | ${marketSlug} | reason=${reason} | ` +
+        `mid=${bookSide.mid.toFixed(4)} exitPx=$${exitPrice.toFixed(4)}`,
+    );
 
     try {
         await execEngine.submitSell({
@@ -340,7 +365,6 @@ async function flattenPosition(marketSlug, pos, bookSide, reason, snapshot) {
             shares:     pos.shares,
         });
 
-        // Determine next state after close
         const { ok, halted } = riskEngine.canTrade();
 
         if (halted && sm.canTransitionTo(State.HALTED)) {
@@ -348,7 +372,7 @@ async function flattenPosition(marketSlug, pos, bookSide, reason, snapshot) {
         } else if (!ok && riskEngine.isCooldown() && sm.canTransitionTo(State.COOLDOWN)) {
             sm.transition(State.COOLDOWN, ReasonCode.RISK_CONSEC_LOSS);
         } else {
-            sm.transition(State.IDLE, `closed_${reason}`);
+            sm.transition(State.IDLE, `emergency_exit_${reason}`);
         }
 
     } catch (err) {
@@ -360,7 +384,7 @@ async function flattenPosition(marketSlug, pos, bookSide, reason, snapshot) {
 
 function onStateTransition(evt) {
     telemetry.logTransition(evt);
-    logger.info(`[SM] ${evt.marketSlug}: ${evt.from} → ${evt.to} | ${evt.reason}`);
+    dbg('SM', `${evt.marketSlug}: ${evt.from} → ${evt.to} | ${evt.reason}`);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -378,11 +402,23 @@ async function shutdown() {
     logger.warn('OneShot: shutting down...');
     feedService?.stop();
 
+    // Report any positions still open at shutdown
+    const markets = feedService?.activeMarkets ?? [];
+    for (const slug of markets) {
+        const pos = posEngine?.getPosition(slug);
+        if (pos) {
+            logger.warn(
+                `OneShot: position still open at shutdown — ${slug} | ` +
+                `${pos.shares} shares @ $${pos.entryPrice.toFixed(4)} | redeemer.js will settle`,
+            );
+        }
+    }
+
     const stats = riskEngine?.stats();
     if (stats) {
         const sign = stats.dailyPnl >= 0 ? '+' : '';
         logger.money(
-            `Session summary | dailyPnl=${sign}$${stats.dailyPnl.toFixed(4)} | ` +
+            `Session summary | emergencyExitPnl=${sign}$${stats.dailyPnl.toFixed(4)} | ` +
             `consecLosses=${stats.consecLosses} | halted=${stats.halted}`,
         );
     }

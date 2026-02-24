@@ -5,28 +5,30 @@
  * Maintains position state per market and evaluates exit conditions
  * on every incoming snapshot tick.
  *
- * Exit priority (highest → lowest):
- *   1. EXIT_TIME_FLATTEN  — TTE <= 12s (hard close, overrides everything)
- *   2. EXIT_TP_HIT        — Current bestBid >= entryPrice + tpTicks × tickSize
- *   3. EXIT_ADVERSE_MOVE  — Mid has dropped >= 2 ticks below entry
- *   4. EXIT_SLOPE_DROP    — Slope has been <= 0 continuously for >= 4 seconds
- *   5. EXIT_TIME_REDUCE   — TTE <= 20s (signals REDUCE_ONLY mode to orchestrator)
+ * Strategy: Hold to Expiry (Dominant Side)
+ * ─────────────────────────────────────────
+ * Positions entered on the dominant (probable winner) side are held until
+ * the market expires and the payout is claimed via the on-chain redeemer.
+ * There are no take-profit sells, no momentum-based exits.
+ *
+ * Exit conditions (priority order):
+ *   1. EXIT_EXPIRED       — TTE <= 0: market has closed, pending on-chain redemption
+ *   2. EXIT_ADVERSE_MOVE  — Token mid has collapsed below the stop-loss floor
+ *                           (configurable absolute threshold, e.g. 0.20)
+ *                           Protects against a complete market reversal while still
+ *                           allowing normal price fluctuations in the dominant range.
  */
 
 import { ReasonCode } from './constants.js';
 
-const HARD_FLATTEN_TTE  = 12;  // seconds
-const REDUCE_TTE        = 20;  // seconds
-const ADVERSE_TICKS     = 2;   // how many ticks below entry triggers adverse exit
-const SLOPE_DROP_HOLD_MS = 4_000; // ms slope must remain <= 0 to trigger exit
-
 export class PositionEngine {
     /**
      * @param {Object} opts
-     * @param {number} opts.tpTicks  - Take-profit in ticks above entry price
+     * @param {number} [opts.stopLossMid=0.20]  - Exit if token mid falls below this absolute level.
+     *                                            Set to 0 to disable the stop-loss entirely.
      */
-    constructor({ tpTicks = 1 }) {
-        this._tpTicks = tpTicks;
+    constructor({ stopLossMid = 0.20 } = {}) {
+        this._stopLossMid = stopLossMid;
 
         /** @type {Map<string, PositionState>} */
         this._positions = new Map();
@@ -53,9 +55,7 @@ export class PositionEngine {
             shares,
             entryPrice,
             tickSize,
-            openedAt:       Date.now(),
-            tpPrice:        this._roundToTick(entryPrice + this._tpTicks * tickSize, tickSize),
-            _slopeDropTs:   null,   // timestamp when slope first went <= 0
+            openedAt: Date.now(),
         });
     }
 
@@ -69,10 +69,10 @@ export class PositionEngine {
     }
 
     /**
-     * Close the position and return exit data including realised P&L.
+     * Close the position actively (adverse-move emergency exit) and return exit data.
      *
      * @param {string} marketSlug
-     * @param {number} exitPrice  - Actual fill price of the exit order
+     * @param {number} exitPrice  - Actual fill price of the sell order
      * @returns {{ pnl: number, shares: number, entryPrice: number, exitPrice: number }}
      */
     close(marketSlug, exitPrice) {
@@ -85,72 +85,48 @@ export class PositionEngine {
         return { pnl, shares: pos.shares, entryPrice: pos.entryPrice, exitPrice };
     }
 
+    /**
+     * Mark a position as expired (market closed, pending on-chain redemption).
+     * Does NOT compute final P&L — that is settled by the redeemer service.
+     *
+     * @param {string} marketSlug
+     * @returns {PositionState|null}
+     */
+    closeExpired(marketSlug) {
+        const pos = this._positions.get(marketSlug) ?? null;
+        if (pos) this._positions.delete(marketSlug);
+        return pos;
+    }
+
     // ── Exit evaluation ────────────────────────────────────────────────────
 
     /**
      * Evaluate whether the current position should be exited.
-     * Called on every snapshot tick while in POSITION_OPEN or REDUCE_ONLY state.
+     * Called on every snapshot tick while in POSITION_OPEN state.
      *
      * @param {string} marketSlug
      * @param {Object} snapshot   - Current market snapshot
-     * @param {Object|null} features  - Latest features from FeatureEngine (may be null)
-     * @returns {{ shouldExit: boolean, reason: string|null, isReduceOnly: boolean }}
+     * @returns {{ shouldExit: boolean, reason: string|null, isExpired: boolean }}
      */
-    evaluateExit(marketSlug, snapshot, features) {
+    evaluateExit(marketSlug, snapshot) {
         const pos = this._positions.get(marketSlug);
-        if (!pos) return { shouldExit: false, reason: null, isReduceOnly: false };
+        if (!pos) return { shouldExit: false, reason: null, isExpired: false };
 
         const { tteSec } = snapshot;
         const bookSide   = pos.side === 'up' ? snapshot.up : snapshot.down;
-        const sideFeat   = features ? (pos.side === 'up' ? features.up : features.down) : null;
-        const now        = Date.now();
 
-        // 1. Hard time flatten
-        if (tteSec <= HARD_FLATTEN_TTE) {
-            return { shouldExit: true, reason: ReasonCode.EXIT_TIME_FLATTEN, isReduceOnly: false };
+        // 1. Market expired — hand off to on-chain redeemer
+        if (tteSec <= 0) {
+            return { shouldExit: false, reason: ReasonCode.EXIT_EXPIRED, isExpired: true };
         }
 
-        // 2. Take-profit hit
-        if (bookSide.bestBid >= pos.tpPrice) {
-            return { shouldExit: true, reason: ReasonCode.EXIT_TP_HIT, isReduceOnly: false };
+        // 2. Catastrophic stop-loss: token has completely collapsed
+        //    (market reversed strongly against us — salvage remaining value)
+        if (this._stopLossMid > 0 && bookSide.mid < this._stopLossMid) {
+            return { shouldExit: true, reason: ReasonCode.EXIT_ADVERSE_MOVE, isExpired: false };
         }
 
-        // 3. Adverse move: mid has fallen >= 2 ticks below entry
-        const adverseFloor = pos.entryPrice - ADVERSE_TICKS * pos.tickSize;
-        if (bookSide.mid < adverseFloor) {
-            return { shouldExit: true, reason: ReasonCode.EXIT_ADVERSE_MOVE, isReduceOnly: false };
-        }
-
-        // 4. Slope drop: slope <= 0 sustained for SLOPE_DROP_HOLD_MS
-        if (sideFeat) {
-            if (sideFeat.midSlope6s <= 0) {
-                if (!pos._slopeDropTs) {
-                    // Start the slope-drop timer
-                    this._positions.set(marketSlug, { ...pos, _slopeDropTs: now });
-                } else if (now - pos._slopeDropTs >= SLOPE_DROP_HOLD_MS) {
-                    return { shouldExit: true, reason: ReasonCode.EXIT_SLOPE_DROP, isReduceOnly: false };
-                }
-            } else {
-                // Positive slope — reset the drop timer
-                if (pos._slopeDropTs) {
-                    this._positions.set(marketSlug, { ...pos, _slopeDropTs: null });
-                }
-            }
-        }
-
-        // 5. Reduce-only signal (non-exiting, just changes state in orchestrator)
-        if (tteSec <= REDUCE_TTE) {
-            return { shouldExit: false, reason: ReasonCode.EXIT_TIME_REDUCE, isReduceOnly: true };
-        }
-
-        return { shouldExit: false, reason: null, isReduceOnly: false };
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────
-
-    _roundToTick(price, tickSize) {
-        const factor = Math.round(1 / tickSize);
-        return Math.round(price * factor) / factor;
+        return { shouldExit: false, reason: null, isExpired: false };
     }
 }
 
@@ -162,7 +138,5 @@ export class PositionEngine {
  * @property {number} shares
  * @property {number} entryPrice
  * @property {number} tickSize
- * @property {number} tpPrice
  * @property {number} openedAt
- * @property {number|null} _slopeDropTs
  */
