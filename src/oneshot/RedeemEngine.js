@@ -273,7 +273,6 @@ export class RedeemEngine {
                 ethers.constants.HashZero,   // parentCollectionId = 0x000...
                 item.conditionId,
                 [1, 2],                      // indexSets: claim both outcomes (CTF discards the losing side)
-                { gasLimit: 300_000 },
             );
 
             logger.info(`RedeemEngine: tx submitted | hash=${tx.hash}`);
