@@ -30,6 +30,7 @@ export const ReasonCode = Object.freeze({
     SIG_NO_CONFIRM:         'SIG_NO_CONFIRM',         // Trend confirmation failed (legacy)
     SIG_NO_DOMINANT:        'SIG_NO_DOMINANT',        // Neither side is clearly dominant (mid gap too small)
     SIG_LOW_DOMINANT:       'SIG_LOW_DOMINANT',       // Dominant side mid below minimum threshold
+    SIG_FADING_DOMINANT:    'SIG_FADING_DOMINANT',    // Dominant side mid is actively falling — reversal risk
 
     // Execution failures
     EXEC_TIMEOUT_NO_FILL:   'EXEC_TIMEOUT_NO_FILL',   // FOK timed out without fill

@@ -2,39 +2,54 @@
  * SignalEngine.js
  * Steps C & D of the runtime sequence.
  *
- * Strategy: Dominant Side Hold
- * ────────────────────────────
- * Unlike a scalper that chases momentum on any side, this engine enters ONLY the
- * side that the market already considers the PROBABLE WINNER (mid > 50%).  The
- * position is then held to expiry (redeemed at $1.00 on-chain) rather than sold
- * back to the order book.
+ * Strategy: Dominant Side Hold — Momentum-Aware Entry
+ * ────────────────────────────────────────────────────
+ * Enters ONLY the side that the market already prices as probable winner
+ * (mid > 50%) AND whose price is either rising or stable.
  *
- * Pipeline per features event:
- *   1. Hard gate check   — stale, TTE out of range, spread too wide, depth thin
- *   2. Dominant side     — compare up.mid vs down.mid; require a clear gap
- *   3. Mid threshold     — dominant side mid must be >= minDominantMid (e.g. 0.60)
- *   4. Composite score   — weighted (mid strength, imbalance, spread)
- *   5. Emit signal       — NO_TRADE (with reason) or ENTER_LONG / ENTER_SHORT
+ * "Follow where the odds are moving" — midSlope6s from FeatureEngine is now
+ * a first-class scoring factor.  A dominant side that is actively FADING
+ * (slope < SLOPE_CANCEL) is blocked entirely even if its mid is still > 0.60,
+ * because a fading dominant signals a potential reversal.
  *
- * Signal event shape:
- *   { ts, marketSlug, tteSec, signal, side, score, reason, snapshot, features }
+ * Entry pipeline (per 'features' event):
+ *   1. Hard gates      — stale, TTE out of [tteMin, tteMax], spread > SPREAD_MAX, depth thin
+ *   2. Dominant side   — identify which token the market prices higher; require mid gap >= MIN_MID_GAP
+ *   3. Min probability — dominant mid must be >= minDominantMid (e.g. 0.58)
+ *   4. Momentum gate   — dominant midSlope6s must be >= SLOPE_CANCEL (not actively fading)
+ *   5. Score           — weighted: mid strength (35%) + momentum (30%) + imbalance (20%) + spread (15%)
+ *   6. Threshold       — score >= scoreThreshold
+ *
+ * Key parameter changes vs previous version:
+ *   - SPREAD_MAX: 0.02 → 0.04  (near-expiry books often have 0.03 spread)
+ *   - tteMax:       90 → 150s  (catch direction when it is being established)
+ *   - Added W_MOMENTUM = 0.30  (replaces old W_SLOPE/W_RETRACE scalper metrics)
+ *   - Added momentum gate (SIG_FADING_DOMINANT) to block reversals
  */
 
 import { Signal, ReasonCode } from './constants.js';
 import { dbg, DEBUG } from './debug.js';
 
 // ── Score weights ──────────────────────────────────────────────────────────────
-// Mid price strength is the most important factor — it reflects market consensus.
-const W_MID       = 0.45;   // How strongly the market favours this side
-const W_IMBALANCE = 0.35;   // Order-book depth confirms the dominant direction
-const W_SPREAD    = 0.20;   // Execution cost (tight spread = better fill)
+const W_MID       = 0.35;   // How strongly the market prices this side as winner
+const W_MOMENTUM  = 0.30;   // Is the dominant odds direction being maintained?
+const W_IMBALANCE = 0.20;   // Order-book depth confirms the direction
+const W_SPREAD    = 0.15;   // Execution cost (less critical for hold-to-expiry)
 
-// ── Thresholds ─────────────────────────────────────────────────────────────────
-const MIN_MID_GAP   = 0.05;  // Minimum |up.mid - down.mid| to consider a side dominant
-const SPREAD_TIGHT  = 0.01;  // Spread considered tight
-const SPREAD_MAX    = 0.02;  // Gate maximum (hard gate uses this too)
-const IMB_STRONG    = 0.20;  // Strong bid-side depth dominance
-const IMB_WEAK      = 0.05;  // Mild bid-side depth dominance
+// ── Gate thresholds ────────────────────────────────────────────────────────────
+const SPREAD_MAX   = 0.04;    // Hard gate: spread wider than this → skip
+const MIN_MID_GAP  = 0.08;    // Hard gate: |up.mid - down.mid| must exceed this
+
+// ── Momentum constants ─────────────────────────────────────────────────────────
+// SLOPE_CANCEL: if dominant side's 6s slope is below this, the market may be
+// reversing — block entry even if mid is still above threshold.
+const SLOPE_CANCEL = -0.0020; // Active fade = potential reversal, do not enter
+const SLOPE_STRONG = 0.0020;  // Clearly rising — best signal
+const SLOPE_MILD   = 0.0005;  // Gently rising — still good
+
+// ── Imbalance constants ────────────────────────────────────────────────────────
+const IMB_STRONG = 0.20;
+const IMB_WEAK   = 0.05;
 
 /** Throttle debug output: log detail every N evaluations per market */
 const DEBUG_EVERY = 5;
@@ -43,13 +58,13 @@ export class SignalEngine {
     /**
      * @param {Object} opts
      * @param {import('./EventBus.js').default} opts.eventBus
-     * @param {number}  opts.scoreThreshold   - Minimum score to trigger entry (0–1)
+     * @param {number}  opts.scoreThreshold   - Minimum composite score to trigger entry (0–1)
      * @param {number}  opts.minTopSize        - Minimum shares at best bid/ask for depth gate
-     * @param {number}  opts.minDominantMid    - Dominant side must have mid >= this (e.g. 0.60)
-     * @param {number}  [opts.tteMin=20]       - Minimum TTE in seconds
-     * @param {number}  [opts.tteMax=90]       - Maximum TTE in seconds
+     * @param {number}  opts.minDominantMid    - Dominant side mid must be >= this (e.g. 0.58)
+     * @param {number}  [opts.tteMin=15]       - Minimum TTE in seconds
+     * @param {number}  [opts.tteMax=150]      - Maximum TTE in seconds
      */
-    constructor({ eventBus, scoreThreshold, minTopSize, minDominantMid = 0.60, tteMin = 20, tteMax = 90 }) {
+    constructor({ eventBus, scoreThreshold, minTopSize, minDominantMid = 0.58, tteMin = 15, tteMax = 150 }) {
         this._eventBus        = eventBus;
         this._scoreThreshold  = scoreThreshold;
         this._minTopSize      = minTopSize;
@@ -68,12 +83,11 @@ export class SignalEngine {
     _onFeatures(feat) {
         const { ts, marketSlug, tteSec, snapshot } = feat;
 
-        // Track evaluation count for throttled debug output
         const evalN = (this._evalCount.get(marketSlug) ?? 0) + 1;
         this._evalCount.set(marketSlug, evalN);
         const logThis = DEBUG && (evalN % DEBUG_EVERY === 1);
 
-        // ── Step C: hard gate check ─────────────────────────────────────────
+        // ── Step C: hard gates ──────────────────────────────────────────────
 
         const gate = this._hardGates(snapshot, tteSec);
 
@@ -81,13 +95,13 @@ export class SignalEngine {
             if (!gate.pass) {
                 dbg('GATE',
                     `${marketSlug} | tte=${tteSec}s | FAIL → ${gate.reason} | ` +
-                    `upSprd=${snapshot.up.spread.toFixed(4)} dnSprd=${snapshot.down.spread.toFixed(4)} ` +
-                    `upBidSz=${snapshot.up.bestBidSize.toFixed(1)} upAskSz=${snapshot.up.bestAskSize.toFixed(1)}`,
+                    `upSprd=${snapshot.up.spread.toFixed(3)} dnSprd=${snapshot.down.spread.toFixed(3)} ` +
+                    `upMid=${snapshot.up.mid.toFixed(3)} dnMid=${snapshot.down.mid.toFixed(3)}`,
                 );
             } else {
                 dbg('GATE',
                     `${marketSlug} | tte=${tteSec}s | PASS | ` +
-                    `upMid=${snapshot.up.mid.toFixed(4)} dnMid=${snapshot.down.mid.toFixed(4)}`,
+                    `upMid=${snapshot.up.mid.toFixed(3)} dnMid=${snapshot.down.mid.toFixed(3)}`,
                 );
             }
         }
@@ -97,61 +111,79 @@ export class SignalEngine {
             return;
         }
 
-        // ── Step D: identify dominant side ──────────────────────────────────
+        // ── Step D1: identify dominant side ─────────────────────────────────
         // The dominant side is whichever token the market prices higher.
-        // We only ever buy the probable winner — never the underdog.
 
         const upMid   = snapshot.up.mid;
         const downMid = snapshot.down.mid;
         const midGap  = Math.abs(upMid - downMid);
 
         if (midGap < MIN_MID_GAP) {
-            // Market is too balanced to pick a winner
             if (logThis) {
                 dbg('SCORE',
-                    `${marketSlug} | NO_DOMINANT | upMid=${upMid.toFixed(4)} dnMid=${downMid.toFixed(4)} ` +
-                    `gap=${midGap.toFixed(4)} < ${MIN_MID_GAP}`,
+                    `${marketSlug} | NO_DOMINANT | upMid=${upMid.toFixed(3)} dnMid=${downMid.toFixed(3)} ` +
+                    `gap=${midGap.toFixed(3)} < ${MIN_MID_GAP}`,
                 );
             }
             this._emit(marketSlug, Signal.NO_TRADE, null, 0, ReasonCode.SIG_NO_DOMINANT, ts, snapshot, feat);
             return;
         }
 
-        const isDominantUp  = upMid > downMid;
-        const dominantMid   = isDominantUp ? upMid   : downMid;
-        const dominantBook  = isDominantUp ? snapshot.up   : snapshot.down;
-        const dominantFeat  = isDominantUp ? feat.up  : feat.down;
-        const signal        = isDominantUp ? Signal.ENTER_LONG : Signal.ENTER_SHORT;
-        const side          = isDominantUp ? 'up' : 'down';
+        const isDominantUp = upMid > downMid;
+        const dominantMid  = isDominantUp ? upMid   : downMid;
+        const dominantBook = isDominantUp ? snapshot.up   : snapshot.down;
+        const dominantFeat = isDominantUp ? feat.up  : feat.down;
+        const signal       = isDominantUp ? Signal.ENTER_LONG : Signal.ENTER_SHORT;
+        const side         = isDominantUp ? 'up' : 'down';
+        const slope        = dominantFeat?.midSlope6s ?? 0;
 
-        // ── Minimum probability gate ─────────────────────────────────────────
-        // Require the dominant token to be priced at least minDominantMid.
-        // Below this threshold the market is too uncertain (e.g. 0.55 = only 55%
-        // confident — not worth the binary risk of holding to expiry).
+        // ── Step D2: minimum probability gate ───────────────────────────────
 
         if (dominantMid < this._minDominantMid) {
             if (logThis) {
                 dbg('SCORE',
                     `${marketSlug} | ${side.toUpperCase()} | LOW_DOMINANT | ` +
-                    `mid=${dominantMid.toFixed(4)} < ${this._minDominantMid}`,
+                    `mid=${dominantMid.toFixed(3)} < ${this._minDominantMid}`,
                 );
             }
             this._emit(marketSlug, Signal.NO_TRADE, null, 0, ReasonCode.SIG_LOW_DOMINANT, ts, snapshot, feat);
             return;
         }
 
-        // ── Composite score ──────────────────────────────────────────────────
+        // ── Step D3: momentum gate ───────────────────────────────────────────
+        // If the dominant side's price is actively falling, the market may be
+        // reversing.  A fading dominant is more dangerous than a weak dominant.
+
+        if (slope < SLOPE_CANCEL) {
+            if (logThis) {
+                dbg('SCORE',
+                    `${marketSlug} | ${side.toUpperCase()} | FADING | ` +
+                    `slope=${slope.toFixed(5)} < ${SLOPE_CANCEL} (reversal risk)`,
+                );
+            }
+            this._emit(marketSlug, Signal.NO_TRADE, null, 0, ReasonCode.SIG_FADING_DOMINANT, ts, snapshot, feat);
+            return;
+        }
+
+        // ── Step D4: composite score ─────────────────────────────────────────
 
         const midScore       = this._scoreMid(dominantMid);
-        const imbalanceScore = this._scoreImbalance(dominantFeat.imbalance);
+        const momentumScore  = this._scoreMomentum(slope);
+        const imbalanceScore = this._scoreImbalance(dominantFeat?.imbalance ?? 0);
         const spreadScore    = this._scoreSpread(dominantBook.spread);
 
-        const score = W_MID * midScore + W_IMBALANCE * imbalanceScore + W_SPREAD * spreadScore;
+        const score =
+            W_MID       * midScore       +
+            W_MOMENTUM  * momentumScore  +
+            W_IMBALANCE * imbalanceScore +
+            W_SPREAD    * spreadScore;
 
         if (logThis) {
             dbg('SCORE',
-                `${marketSlug} | ${side.toUpperCase()} dominant | mid=${dominantMid.toFixed(4)} gap=${midGap.toFixed(4)} | ` +
-                `midS=${midScore.toFixed(2)} imbS=${imbalanceScore.toFixed(2)} sprdS=${spreadScore.toFixed(2)} ` +
+                `${marketSlug} | ${side.toUpperCase()} dominant | ` +
+                `mid=${dominantMid.toFixed(3)} gap=${midGap.toFixed(3)} slope=${slope.toFixed(5)} | ` +
+                `midS=${midScore.toFixed(2)} momS=${momentumScore.toFixed(2)} ` +
+                `imbS=${imbalanceScore.toFixed(2)} sprdS=${spreadScore.toFixed(2)} ` +
                 `→ score=${score.toFixed(3)} (need ${this._scoreThreshold})`,
             );
         }
@@ -163,7 +195,8 @@ export class SignalEngine {
 
         // Always log qualifying entries regardless of throttle
         dbg('SIGNAL',
-            `>>> ${signal} | ${marketSlug} | mid=${dominantMid.toFixed(4)} ` +
+            `>>> ${signal} | ${marketSlug} | ` +
+            `mid=${dominantMid.toFixed(3)} slope=${slope.toFixed(5)} ` +
             `score=${score.toFixed(3)} tte=${tteSec}s`,
         );
 
@@ -172,10 +205,6 @@ export class SignalEngine {
 
     // ── Hard gates ────────────────────────────────────────────────────────────
 
-    /**
-     * Hard gates — any failure aborts the evaluation immediately.
-     * @returns {{ pass: boolean, reason: string|null }}
-     */
     _hardGates(snapshot, tteSec) {
         if (snapshot.stale)
             return { pass: false, reason: ReasonCode.GATE_STALE_BOOK };
@@ -183,9 +212,13 @@ export class SignalEngine {
         if (tteSec < this._tteMin || tteSec > this._tteMax)
             return { pass: false, reason: ReasonCode.GATE_TTE_FAIL };
 
-        if (snapshot.up.spread > SPREAD_MAX || snapshot.down.spread > SPREAD_MAX)
+        // Use the dominant side's spread only — underdog's spread is irrelevant
+        // since we never buy the underdog.
+        const dominantSpread = Math.min(snapshot.up.spread, snapshot.down.spread);
+        if (dominantSpread > SPREAD_MAX)
             return { pass: false, reason: ReasonCode.GATE_SPREAD_WIDE };
 
+        // Require adequate depth on at least one side (dominant side check happens after)
         const thinUp   = snapshot.up.bestBidSize   < this._minTopSize
                       || snapshot.up.bestAskSize   < this._minTopSize;
         const thinDown = snapshot.down.bestBidSize < this._minTopSize
@@ -200,37 +233,58 @@ export class SignalEngine {
     // ── Scoring helpers ───────────────────────────────────────────────────────
 
     /**
-     * Score how strongly the market favours this side.
-     * Higher mid = market is more confident = higher score.
-     *   0.60–0.69 → 0.4  (marginal dominance, acceptable)
-     *   0.70–0.79 → 0.7  (solid dominance)
-     *   0.80–0.89 → 0.9  (strong dominance)
-     *   0.90+     → 1.0  (near-certain — but low payout)
+     * Score market confidence in the dominant side.
+     * Higher mid price = market is more certain = higher score.
+     * Entry "sweet spot" is 0.60–0.80 (clear direction, still worth holding).
      */
     _scoreMid(mid) {
-        if (mid >= 0.90) return 1.0;
-        if (mid >= 0.80) return 0.9;
-        if (mid >= 0.70) return 0.7;
-        if (mid >= 0.60) return 0.4;
+        if (mid >= 0.85) return 1.00;
+        if (mid >= 0.75) return 0.85;
+        if (mid >= 0.65) return 0.65;
+        if (mid >= 0.58) return 0.40;
         return 0;
     }
 
     /**
-     * Score order-book imbalance for the dominant side.
-     * Positive imbalance means more buy depth (bids > asks) — confirms direction.
-     * A mildly negative imbalance is tolerated (some ask pressure is normal).
+     * Score the momentum (direction) of the dominant side's price movement.
+     * This is the "follow where the odds are moving" factor.
+     *
+     * Positive slope = dominant side is getting more expensive = conviction increasing.
+     * Flat slope     = direction held, acceptable.
+     * Mild negative  = slight give-back, cautious but still allowed.
+     * SLOPE_CANCEL   = actively fading = blocked by momentum gate before reaching here.
      */
-    _scoreImbalance(imb) {
-        if (imb >= IMB_STRONG) return 1.0;
-        if (imb >= IMB_WEAK)   return 0.7;
-        if (imb >= -0.10)      return 0.4;   // neutral to slight ask pressure — still ok
-        if (imb >= -0.25)      return 0.1;   // notable selling pressure — cautious
-        return 0;                             // strongly negative — skip
+    _scoreMomentum(slope) {
+        if (slope >= SLOPE_STRONG) return 1.00;   // Strong, fast move in dominant direction
+        if (slope >= SLOPE_MILD)   return 0.75;   // Steady climb
+        if (slope >= 0)            return 0.50;   // Flat / holding
+        if (slope >= -0.0005)      return 0.20;   // Slight give-back — cautious
+        return 0.05;                              // Between -0.0005 and SLOPE_CANCEL — marginal
     }
 
+    /**
+     * Score order-book imbalance for the dominant side.
+     * Positive = more buy depth on dominant side = confirms direction.
+     * Mildly negative = tolerated (sellers exist on winner too, normal).
+     */
+    _scoreImbalance(imb) {
+        if (imb >= IMB_STRONG) return 1.00;
+        if (imb >= IMB_WEAK)   return 0.70;
+        if (imb >= -0.10)      return 0.40;   // Neutral to slight sell pressure
+        if (imb >= -0.25)      return 0.10;   // Notable sell pressure
+        return 0;
+    }
+
+    /**
+     * Score execution cost (spread).
+     * For hold-to-expiry the spread is paid once at entry, so wider spreads
+     * are more tolerated than in a scalping strategy — hence 4 tiers up to SPREAD_MAX.
+     */
     _scoreSpread(spread) {
-        if (spread <= SPREAD_TIGHT) return 1.0;
-        if (spread <= SPREAD_MAX)   return 0.5;
+        if (spread <= 0.01) return 1.00;
+        if (spread <= 0.02) return 0.70;
+        if (spread <= 0.03) return 0.40;
+        if (spread <= 0.04) return 0.10;
         return 0;
     }
 
