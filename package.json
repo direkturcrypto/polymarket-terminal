@@ -1,18 +1,38 @@
 {
   "name": "polymarket-terminal",
   "version": "1.0.0",
+  "private": true,
   "description": "Automated trading terminal for Polymarket — copy trades, market make, and snipe orderbooks from the command line",
   "main": "src/index.js",
   "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "start": "node src/index.js",
+    "start": "tsx packages/engine/src/cli/runBotViaController.ts copy",
+    "start:legacy": "node src/index.js",
     "dev": "nodemon --ignore 'data/*.json' src/index.js",
-    "mm": "DRY_RUN=false node src/mm.js",
-    "mm-sim": "DRY_RUN=true node src/mm.js",
-    "mm-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/mm.js",
-    "sniper": "DRY_RUN=false node src/sniper.js",
-    "sniper-sim": "DRY_RUN=true node src/sniper.js",
-    "sniper-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper.js"
+    "mm": "DRY_RUN=false tsx packages/engine/src/cli/runBotViaController.ts mm",
+    "mm:legacy": "DRY_RUN=false node src/mm.js",
+    "mm-sim": "DRY_RUN=true tsx packages/engine/src/cli/runBotViaController.ts mm",
+    "mm-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' --exec \"tsx packages/engine/src/cli/runBotViaController.ts mm\"",
+    "sniper": "DRY_RUN=false tsx packages/engine/src/cli/runBotViaController.ts sniper",
+    "sniper:legacy": "DRY_RUN=false node src/sniper.js",
+    "sniper-sim": "DRY_RUN=true tsx packages/engine/src/cli/runBotViaController.ts sniper",
+    "sniper-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' --exec \"tsx packages/engine/src/cli/runBotViaController.ts sniper\"",
+    "api:dev": "npm run dev -w @polymarket/api",
+    "api:start": "npm run start -w @polymarket/api",
+    "stack:dev": "node scripts/start-stack.js dev",
+    "stack:start": "node scripts/start-stack.js start",
+    "qa:bench:api": "node scripts/bench-api-latency.js",
+    "qa:soak:ws": "node scripts/soak-ws.js",
+    "lint": "eslint \"apps/**/*.{ts,tsx,js}\" \"packages/**/*.{ts,tsx,js}\" \"scripts/**/*.{js,ts}\"",
+    "format": "prettier --check \"apps/**/*.{ts,tsx,js,json}\" \"packages/**/*.{ts,tsx,js,json}\" \"scripts/**/*.{js,ts}\" \"*.{json,js,ts,yml,yaml}\" \".github/workflows/*.yml\"",
+    "format:write": "prettier --write \"apps/**/*.{ts,tsx,js,json}\" \"packages/**/*.{ts,tsx,js,json}\" \"scripts/**/*.{js,ts}\" \"*.{json,js,ts,yml,yaml}\" \".github/workflows/*.yml\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "polymarket",
@@ -29,6 +49,16 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.9"
+    "@next/eslint-plugin-next": "^15.5.3",
+    "@eslint/js": "^9.22.0",
+    "@types/node": "^24.5.2",
+    "eslint": "^9.22.0",
+    "globals": "^16.4.0",
+    "nodemon": "^3.1.9",
+    "prettier": "^3.6.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.44.1",
+    "vitest": "^3.2.4"
   }
 }

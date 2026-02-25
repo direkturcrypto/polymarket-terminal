@@ -7,8 +7,22 @@ let logBox    = null;
 let statusBox = null;
 let active    = false;
 
+function shouldEnableDashboard() {
+    if (process.env.NO_TUI === 'true') return false;
+    return Boolean(process.stdout?.isTTY && process.stdin?.isTTY);
+}
+
 
 export function initDashboard() {
+    if (!shouldEnableDashboard()) {
+        active = false;
+        screen = null;
+        logBox = null;
+        statusBox = null;
+        process.stdout.write('[dashboard] non-interactive mode detected, using plain logs\n');
+        return null;
+    }
+
     screen = blessed.screen({
         smartCSR: false,   // avoid complex cursor escape sequences
         title: 'Polymarket Copy Trade',
