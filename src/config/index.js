@@ -23,6 +23,10 @@ const config = {
 
   // Polygon RPC
   polygonRpcUrl: process.env.POLYGON_RPC_URL || 'https://polygon-bor-rpc.publicnode.com',
+  polygonRpcFallbackUrls: (process.env.POLYGON_RPC_FALLBACK_URLS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
 
   // Trader to copy
   traderAddress: process.env.TRADER_ADDRESS,
@@ -80,6 +84,14 @@ const config = {
     .filter(Boolean),
   sniperPrice: parseFloat(process.env.SNIPER_PRICE || '0.01'), // $ per share
   sniperShares: parseFloat(process.env.SNIPER_SHARES || '5'), // shares per side
+  sniperLateEnabled: process.env.SNIPER_LATE_ENABLED === 'true',
+  sniperLateDurations: (process.env.SNIPER_LATE_DURATIONS || '5m,15m')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
+  sniperLateCloseWindow: parseInt(process.env.SNIPER_LATE_CLOSE_WINDOW || '30', 10),
+  sniperLateMinPrice: parseFloat(process.env.SNIPER_LATE_MIN_PRICE || '0.95'),
+  sniperLateMaxPrice: parseFloat(process.env.SNIPER_LATE_MAX_PRICE || '0.99'),
 };
 
 // Validation for copy-trade bot
@@ -110,6 +122,42 @@ export function validateMMConfig() {
 
   if (![0, 1, 2].includes(config.polySignatureType)) {
     throw new Error('POLY_SIGNATURE_TYPE must be one of: 0, 1, 2');
+  }
+
+  if (config.sniperPrice <= 0 || config.sniperPrice >= 1) {
+    throw new Error('SNIPER_PRICE must be between 0 and 1');
+  }
+
+  if (config.sniperShares <= 0) {
+    throw new Error('SNIPER_SHARES must be > 0');
+  }
+
+  if (config.sniperLateCloseWindow <= 0) {
+    throw new Error('SNIPER_LATE_CLOSE_WINDOW must be > 0');
+  }
+
+  if (
+    config.sniperLateMinPrice <= 0 ||
+    config.sniperLateMinPrice >= 1 ||
+    config.sniperLateMaxPrice <= 0 ||
+    config.sniperLateMaxPrice >= 1 ||
+    config.sniperLateMinPrice >= config.sniperLateMaxPrice
+  ) {
+    throw new Error(
+      'SNIPER_LATE_MIN_PRICE and SNIPER_LATE_MAX_PRICE must satisfy 0 < min < max < 1',
+    );
+  }
+
+  if (config.sniperLateEnabled) {
+    const invalidDurations = config.sniperLateDurations.filter(
+      (duration) => duration !== '5m' && duration !== '15m',
+    );
+
+    if (invalidDurations.length > 0) {
+      throw new Error(
+        `SNIPER_LATE_DURATIONS contains invalid value(s): ${invalidDurations.join(', ')}`,
+      );
+    }
   }
 }
 

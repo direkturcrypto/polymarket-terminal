@@ -6,6 +6,71 @@ import logger from '../utils/logger.js';
 let clobClient = null;
 let signer = null;
 let orderMakerAddress = null;
+let cachedRpcUrl = null;
+let cachedRpcCheckedAt = 0;
+
+const RPC_PROBE_TIMEOUT_MS = 8_000;
+const RPC_CACHE_TTL_MS = 60_000;
+
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  });
+}
+
+function buildRpcCandidates() {
+  const deduped = [];
+
+  for (const rawUrl of [config.polygonRpcUrl, ...config.polygonRpcFallbackUrls]) {
+    const url = String(rawUrl || '').trim();
+    if (!url || deduped.includes(url)) {
+      continue;
+    }
+    deduped.push(url);
+  }
+
+  if (
+    cachedRpcUrl &&
+    Date.now() - cachedRpcCheckedAt < RPC_CACHE_TTL_MS &&
+    deduped.includes(cachedRpcUrl)
+  ) {
+    return [cachedRpcUrl, ...deduped.filter((url) => url !== cachedRpcUrl)];
+  }
+
+  return deduped;
+}
+
+async function probeRpcProvider(ethers, url) {
+  const provider = new ethers.providers.StaticJsonRpcProvider(url, {
+    chainId: config.chainId,
+    name: 'matic',
+  });
+
+  const chainIdHex = await withTimeout(
+    provider.send('eth_chainId', []),
+    RPC_PROBE_TIMEOUT_MS,
+    'eth_chainId',
+  );
+  const rawChainId = String(chainIdHex).trim().toLowerCase();
+  const chainId = rawChainId.startsWith('0x')
+    ? Number.parseInt(rawChainId, 16)
+    : Number.parseInt(rawChainId, 10);
+  if (chainId !== config.chainId) {
+    throw new Error(`unexpected chainId ${chainId} (expected ${config.chainId})`);
+  }
+
+  await withTimeout(provider.getBlockNumber(), RPC_PROBE_TIMEOUT_MS, 'getBlockNumber');
+  return provider;
+}
 
 function resolveFunderAddress(signatureType, signerAddress, proxyWallet) {
   if (signatureType === 0) {
@@ -230,8 +295,30 @@ export function getSigner() {
  */
 export async function getPolygonProvider() {
   const { ethers } = await import('ethers');
-  const provider = new ethers.providers.JsonRpcProvider(config.polygonRpcUrl);
-  return provider;
+  const urls = buildRpcCandidates();
+
+  if (urls.length === 0) {
+    throw new Error('No Polygon RPC URL configured');
+  }
+
+  let lastError = null;
+
+  for (const url of urls) {
+    try {
+      const provider = await probeRpcProvider(ethers, url);
+      cachedRpcUrl = url;
+      cachedRpcCheckedAt = Date.now();
+      return provider;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const reason =
+    lastError instanceof Error && lastError.message
+      ? lastError.message
+      : 'unknown connectivity error';
+  throw new Error(`Unable to reach Polygon RPC (tried ${urls.length} endpoint(s)): ${reason}`);
 }
 
 /**

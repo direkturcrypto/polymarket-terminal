@@ -25,6 +25,39 @@ const BALANCE_COOLDOWN_MS = 60_000;
 let insufficientFundsCooldownUntil = 0;
 let lastInsufficientFundsLogAt = 0;
 
+function parseMidpoint(rawValue) {
+  const parsed = Number.parseFloat(String(rawValue));
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed >= 1) {
+    return null;
+  }
+
+  return parsed;
+}
+
+function floorToTick(value, rawTickSize) {
+  const tick = Number.parseFloat(String(rawTickSize));
+  const safeTick = Number.isFinite(tick) && tick > 0 ? tick : 0.01;
+  const floored = Math.floor(value / safeTick) * safeTick;
+  return Number.parseFloat(floored.toFixed(6));
+}
+
+function resolveSecondsToClose(market) {
+  if (Number.isFinite(market.secondsToClose)) {
+    return Number(market.secondsToClose);
+  }
+
+  if (!market.endTime) {
+    return null;
+  }
+
+  const endAt = new Date(market.endTime).getTime();
+  if (!Number.isFinite(endAt)) {
+    return null;
+  }
+
+  return Math.round((endAt - Date.now()) / 1000);
+}
+
 function extractOrderFailureReason(value) {
   if (!value) return 'unknown';
 
@@ -85,7 +118,159 @@ export function getActiveSnipes() {
   return [...activeSnipes];
 }
 
+async function executeLateCloseSnipe(market) {
+  if (!config.sniperLateEnabled) {
+    return;
+  }
+
+  const { asset, duration = '5m', question, yesTokenId, noTokenId, tickSize, negRisk } = market;
+  const label = question.slice(0, 40);
+  const sim = config.dryRun ? '[SIM] ' : '';
+  const secondsToClose = resolveSecondsToClose(market);
+
+  if (secondsToClose === null || secondsToClose <= 0) {
+    return;
+  }
+
+  if (secondsToClose > config.sniperLateCloseWindow) {
+    return;
+  }
+
+  if (!config.dryRun && Date.now() < insufficientFundsCooldownUntil) {
+    const waitSeconds = Math.max(
+      1,
+      Math.ceil((insufficientFundsCooldownUntil - Date.now()) / 1000),
+    );
+    logger.warn(
+      `SNIPER[LATE]: skipping ${asset.toUpperCase()} ${duration} attempts for ${waitSeconds}s (balance/allowance cooldown)`,
+    );
+    return;
+  }
+
+  const client = getClient();
+  const sides = [
+    { name: 'UP', tokenId: yesTokenId },
+    { name: 'DOWN', tokenId: noTokenId },
+  ];
+
+  const candidates = [];
+  for (const side of sides) {
+    try {
+      const midpointResponse = await client.getMidpoint(side.tokenId);
+      const midpoint = parseMidpoint(midpointResponse?.mid ?? midpointResponse);
+      if (midpoint === null) {
+        continue;
+      }
+
+      if (midpoint >= config.sniperLateMinPrice && midpoint <= config.sniperLateMaxPrice) {
+        candidates.push({ ...side, midpoint });
+      }
+    } catch {
+      // ignore single-side quote failures
+    }
+  }
+
+  if (candidates.length === 0) {
+    logger.info(
+      `SNIPER[LATE]: ${asset.toUpperCase()} ${duration} no side in ${Math.round(config.sniperLateMinPrice * 100)}-${Math.round(config.sniperLateMaxPrice * 100)}c window (${secondsToClose}s left)`,
+    );
+    return;
+  }
+
+  logger.info(
+    `SNIPER[LATE]: ${sim}${asset.toUpperCase()} ${duration} — "${label}" | ${secondsToClose}s left | placing ${candidates.length} high-probability order(s)`,
+  );
+
+  for (const candidate of candidates) {
+    const boundedPrice = Math.min(candidate.midpoint, config.sniperLateMaxPrice);
+    const price = floorToTick(boundedPrice, tickSize);
+
+    if (price < config.sniperLateMinPrice || price >= 1) {
+      continue;
+    }
+
+    if (config.dryRun) {
+      const cost = price * config.sniperShares;
+      logger.trade(
+        `SNIPER[LATE][SIM]: ${asset.toUpperCase()} ${candidate.name} @ $${price.toFixed(3)} × ${config.sniperShares}sh | cost $${cost.toFixed(3)} | payout $${config.sniperShares.toFixed(3)} if wins`,
+      );
+      activeSnipes.push({
+        asset: `${asset.toUpperCase()}*`,
+        side: `${candidate.name}-LATE`,
+        question: label,
+        orderId: `sim-late-${Date.now()}-${candidate.tokenId.slice(-6)}`,
+        price,
+        shares: config.sniperShares,
+        cost,
+        potentialPayout: config.sniperShares,
+      });
+      continue;
+    }
+
+    try {
+      const res = await client.createAndPostOrder(
+        {
+          tokenID: candidate.tokenId,
+          side: Side.BUY,
+          price,
+          size: config.sniperShares,
+        },
+        { tickSize, negRisk },
+        OrderType.FOK,
+      );
+
+      if (res?.success) {
+        const cost = price * config.sniperShares;
+        logger.trade(
+          `SNIPER[LATE]: ${asset.toUpperCase()} ${candidate.name} @ $${price.toFixed(3)} × ${config.sniperShares}sh | cost $${cost.toFixed(3)} | order ${res.orderID}`,
+        );
+        activeSnipes.push({
+          asset: `${asset.toUpperCase()}*`,
+          side: `${candidate.name}-LATE`,
+          question: label,
+          orderId: res.orderID,
+          price,
+          shares: config.sniperShares,
+          cost,
+          potentialPayout: config.sniperShares,
+        });
+      } else {
+        const reason = extractOrderFailureReason(res);
+        logger.warn(
+          `SNIPER[LATE]: ${asset.toUpperCase()} ${candidate.name} order failed — ${reason}`,
+        );
+
+        if (isBalanceOrAllowanceFailure(reason)) {
+          insufficientFundsCooldownUntil = Date.now() + BALANCE_COOLDOWN_MS;
+          await logInsufficientBalanceContext();
+          logger.warn(
+            `SNIPER: pausing new order attempts for ${Math.round(BALANCE_COOLDOWN_MS / 1000)}s due to insufficient balance/allowance`,
+          );
+          break;
+        }
+      }
+    } catch (error) {
+      const reason = extractOrderFailureReason(error);
+      logger.error(`SNIPER[LATE]: ${asset.toUpperCase()} ${candidate.name} error — ${reason}`);
+
+      if (isBalanceOrAllowanceFailure(reason)) {
+        insufficientFundsCooldownUntil = Date.now() + BALANCE_COOLDOWN_MS;
+        await logInsufficientBalanceContext();
+        logger.warn(
+          `SNIPER: pausing new order attempts for ${Math.round(BALANCE_COOLDOWN_MS / 1000)}s due to insufficient balance/allowance`,
+        );
+        break;
+      }
+    }
+  }
+}
+
 export async function executeSnipe(market) {
+  if (market.strategy === 'late') {
+    await executeLateCloseSnipe(market);
+    return;
+  }
+
   const { asset, conditionId, question, yesTokenId, noTokenId, tickSize, negRisk } = market;
   const label = question.slice(0, 40);
   const sim = config.dryRun ? '[SIM] ' : '';
