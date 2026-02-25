@@ -32,7 +32,20 @@
    npm run dev -w @polymarket/web
    ```
 
-5. Open dashboard at `http://127.0.0.1:3000`.
+5. Open the dashboard URL printed by `stack:*` logs.
+
+   Notes:
+
+   - If `3000` or `18789` is already occupied, `stack:*` auto-selects the next free port.
+   - Override default ports:
+
+   ```bash
+   # PowerShell
+   $env:API_PORT="18790"; $env:WEB_PORT="3002"; npm run stack:start
+
+   # bash/zsh
+   API_PORT=18790 WEB_PORT=3002 npm run stack:start
+   ```
 
 ## 2) Bot lifecycle operations
 

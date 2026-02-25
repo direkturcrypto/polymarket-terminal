@@ -1,4 +1,12 @@
-import type { BotId, BotMode, BotStatus, RuntimeConfig } from '@polymarket/shared';
+import type {
+  Alert,
+  AuditEvent,
+  BotId,
+  BotMode,
+  BotStatus,
+  LogEntry,
+  RuntimeConfig,
+} from '@polymarket/shared';
 
 const DEFAULT_API_BASE_URL = 'http://127.0.0.1:18789';
 
@@ -117,15 +125,15 @@ export function getMetrics(): Promise<unknown> {
   return apiRequest('/api/v1/metrics');
 }
 
-export function getLogs(limit = 200): Promise<{ logs: unknown[] }> {
+export function getLogs(limit = 200): Promise<{ logs: LogEntry[] }> {
   return apiRequest(`/api/v1/logs?limit=${limit}`);
 }
 
-export function getAlerts(limit = 200): Promise<{ alerts: unknown[] }> {
+export function getAlerts(limit = 200): Promise<{ alerts: Alert[] }> {
   return apiRequest(`/api/v1/alerts?limit=${limit}`);
 }
 
-export function getAudit(limit = 200): Promise<{ events: unknown[] }> {
+export function getAudit(limit = 200): Promise<{ events: AuditEvent[] }> {
   return apiRequest(`/api/v1/audit?limit=${limit}`);
 }
 

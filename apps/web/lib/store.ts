@@ -20,6 +20,7 @@ import type {
   AppSnapshot,
   BotStatusMap,
   ChatMessage,
+  LogBotFilter,
   SessionEntry,
   ThemeName,
   ToolCallEntry,
@@ -29,6 +30,13 @@ import { createId, nowIso, trimToSingleLine } from './utils';
 const STORAGE_KEY = 'polymarket-web-ui-state-v1';
 const MAX_LOGS = 300;
 const MAX_ALERTS = 100;
+const INITIAL_TIMESTAMP = '1970-01-01T00:00:00.000Z';
+const INITIAL_SESSION_ID = 'session_initial';
+const INITIAL_MESSAGE_ID = 'message_initial_assistant';
+const WELCOME_MESSAGE =
+  'Welcome to the hybrid control shell. Type `/help` to see operator commands for bot control and diagnostics.';
+const CLEAR_CONFIRMATION_MESSAGE =
+  'Operational assistant cleared for this session. Type `/help` to start a new run.';
 
 interface AppStore {
   sessions: SessionEntry[];
@@ -38,6 +46,7 @@ interface AppStore {
   theme: ThemeName;
   commandPaletteOpen: boolean;
   rightPanelOpen: boolean;
+  logBotFilter: LogBotFilter;
   logs: LogEntry[];
   alerts: Alert[];
   bots: BotStatusMap;
@@ -47,6 +56,7 @@ interface AppStore {
   setSearchQuery: (value: string) => void;
   setConnectionState: (state: 'connecting' | 'connected' | 'disconnected') => void;
   setCommandPaletteOpen: (value: boolean) => void;
+  setLogBotFilter: (value: LogBotFilter) => void;
   toggleRightPanel: () => void;
 
   createSession: () => void;
@@ -55,6 +65,7 @@ interface AppStore {
   toggleArchiveSession: (sessionId: string) => void;
 
   submitPrompt: (input: string) => Promise<void>;
+  clearCurrentSession: () => void;
   toggleToolExpanded: (messageId: string, toolId: string) => void;
   ingestStreamEvent: (event: StreamEvent) => void;
 }
@@ -64,31 +75,40 @@ function initialBotState(bot: 'copy' | 'mm' | 'sniper') {
     bot,
     mode: 'dry' as const,
     state: 'idle' as const,
-    updatedAt: nowIso(),
+    updatedAt: INITIAL_TIMESTAMP,
     lastError: null,
   };
 }
 
-function createInitialSession(): SessionEntry {
-  const createdAt = nowIso();
-
+function createAssistantMessage(id: string, createdAt: string, content: string): ChatMessage {
   return {
-    id: createId('session'),
+    id,
+    role: 'assistant',
+    content,
+    createdAt,
+  };
+}
+
+function createSessionEntry(sessionId: string, messageId: string, createdAt: string): SessionEntry {
+  return {
+    id: sessionId,
     title: 'New Session',
     pinned: false,
     archived: false,
     createdAt,
     updatedAt: createdAt,
-    messages: [
-      {
-        id: createId('message'),
-        role: 'assistant',
-        content:
-          'Welcome to the hybrid control shell. Type `/help` to see operator commands for bot control and diagnostics.',
-        createdAt,
-      },
-    ],
+    messages: [createAssistantMessage(messageId, createdAt, WELCOME_MESSAGE)],
   };
+}
+
+function createInitialSession(): SessionEntry {
+  return createSessionEntry(INITIAL_SESSION_ID, INITIAL_MESSAGE_ID, INITIAL_TIMESTAMP);
+}
+
+function createRuntimeSession(): SessionEntry {
+  const createdAt = nowIso();
+
+  return createSessionEntry(createId('session'), createId('message'), createdAt);
 }
 
 function updateSessionById(
@@ -289,6 +309,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     theme: 'dark',
     commandPaletteOpen: false,
     rightPanelOpen: true,
+    logBotFilter: 'all',
     logs: [],
     alerts: [],
     bots: {
@@ -329,13 +350,17 @@ export const useAppStore = create<AppStore>((set, get) => {
       set(() => ({ commandPaletteOpen: value }));
     },
 
+    setLogBotFilter: (value) => {
+      set(() => ({ logBotFilter: value }));
+    },
+
     toggleRightPanel: () => {
       set((state) => ({ rightPanelOpen: !state.rightPanelOpen }));
     },
 
     createSession: () => {
       set((state) => {
-        const session = createInitialSession();
+        const session = createRuntimeSession();
         const sessions = [session, ...state.sessions];
         save(sessions, session.id, state.theme);
         return {
@@ -515,6 +540,22 @@ export const useAppStore = create<AppStore>((set, get) => {
           commandErrorText(command, message),
         );
       }
+    },
+
+    clearCurrentSession: () => {
+      set((state) => {
+        const timestamp = nowIso();
+        const sessions = updateSessionById(state.sessions, state.currentSessionId, (session) => ({
+          ...session,
+          updatedAt: timestamp,
+          messages: [
+            createAssistantMessage(createId('message'), timestamp, CLEAR_CONFIRMATION_MESSAGE),
+          ],
+        }));
+
+        save(sessions, state.currentSessionId, state.theme);
+        return { sessions };
+      });
     },
 
     toggleToolExpanded: (messageId, toolId) => {

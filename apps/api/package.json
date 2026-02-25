@@ -12,6 +12,7 @@
     "@fastify/websocket": "^11.2.0",
     "@polymarket/engine": "file:../../packages/engine",
     "@polymarket/shared": "file:../../packages/shared",
+    "dotenv": "^16.4.7",
     "fastify": "^5.6.1"
   }
 }

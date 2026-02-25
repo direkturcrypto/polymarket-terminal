@@ -13,10 +13,10 @@ interface TopNavProps {
 export function TopNav(props: TopNavProps) {
   const stateLabel =
     props.connectionState === 'connected'
-      ? 'API Connected'
+      ? 'Link Stable'
       : props.connectionState === 'connecting'
-        ? 'Reconnecting'
-        : 'Disconnected';
+        ? 'Recovering Link'
+        : 'Offline';
 
   return (
     <header className="topnav">
@@ -30,8 +30,8 @@ export function TopNav(props: TopNavProps) {
       </button>
 
       <div className="headlineWrap">
-        <h1>Hybrid Console</h1>
-        <span className="modeBadge">Live Ops Shell</span>
+        <h1>Mission Control</h1>
+        <span className="modeBadge">Hybrid Ops</span>
       </div>
 
       <div className="topnavActions">

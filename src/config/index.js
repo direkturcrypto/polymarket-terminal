@@ -3,13 +3,17 @@ dotenv.config();
 
 const config = {
   // Wallet
-  privateKey: process.env.PRIVATE_KEY,         // EOA private key (for signing only)
+  privateKey: process.env.PRIVATE_KEY, // EOA private key (for signing only)
   proxyWallet: process.env.PROXY_WALLET_ADDRESS, // Polymarket proxy wallet (deposit USDC here)
 
   // Polymarket API (optional, auto-derived if empty)
   clobApiKey: process.env.CLOB_API_KEY || '',
   clobApiSecret: process.env.CLOB_API_SECRET || '',
   clobApiPassphrase: process.env.CLOB_API_PASSPHRASE || '',
+
+  // CLOB signature type
+  // 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
+  polySignatureType: Number.parseInt(process.env.POLY_SIGNATURE_TYPE || '1', 10),
 
   // Polymarket endpoints
   clobHost: 'https://clob.polymarket.com',
@@ -47,30 +51,35 @@ const config = {
   retryDelay: 3000,
 
   // ── Market Maker ──────────────────────────────────────────────
-  mmAssets:        (process.env.MM_ASSETS || 'btc')
-                     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
-  mmDuration:      process.env.MM_DURATION || '5m',  // '5m' or '15m'
-  mmTradeSize:     parseFloat(process.env.MM_TRADE_SIZE     || '5'),    // USDC per side
-  mmSellPrice:     parseFloat(process.env.MM_SELL_PRICE     || '0.60'), // limit sell target
-  mmCutLossTime:   parseInt(  process.env.MM_CUT_LOSS_TIME  || '60', 10), // seconds before close
-  mmMarketKeyword: process.env.MM_MARKET_KEYWORD            || 'Bitcoin Up or Down',
-  mmEntryWindow:   parseInt(  process.env.MM_ENTRY_WINDOW   || '45', 10), // max secs after open
-  mmPollInterval:  parseInt(  process.env.MM_POLL_INTERVAL  || '10', 10) * 1000,
+  mmAssets: (process.env.MM_ASSETS || 'btc')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+  mmDuration: process.env.MM_DURATION || '5m', // '5m' or '15m'
+  mmTradeSize: parseFloat(process.env.MM_TRADE_SIZE || '5'), // USDC per side
+  mmSellPrice: parseFloat(process.env.MM_SELL_PRICE || '0.60'), // limit sell target
+  mmSplitFallback: process.env.MM_SPLIT_FALLBACK !== 'false', // fallback to CLOB dual-buy if splitPosition fails
+  mmCutLossTime: parseInt(process.env.MM_CUT_LOSS_TIME || '60', 10), // seconds before close
+  mmMarketKeyword: process.env.MM_MARKET_KEYWORD || 'Bitcoin Up or Down',
+  mmEntryWindow: parseInt(process.env.MM_ENTRY_WINDOW || '45', 10), // max secs after open
+  mmPollInterval: parseInt(process.env.MM_POLL_INTERVAL || '10', 10) * 1000,
 
   // ── Recovery Buy (after cut-loss) ─────────────────────────────
   // When enabled: after cutting loss, monitor prices for 10s and
   // market-buy the dominant side if it's above threshold and rising/stable.
-  mmRecoveryBuy:       process.env.MM_RECOVERY_BUY         === 'true',
+  mmRecoveryBuy: process.env.MM_RECOVERY_BUY === 'true',
   mmRecoveryThreshold: parseFloat(process.env.MM_RECOVERY_THRESHOLD || '0.70'), // min price to qualify
-  mmRecoverySize:      parseFloat(process.env.MM_RECOVERY_SIZE      || '0'),    // 0 = use mmTradeSize
+  mmRecoverySize: parseFloat(process.env.MM_RECOVERY_SIZE || '0'), // 0 = use mmTradeSize
 
   // ── Orderbook Sniper ───────────────────────────────────────────
   // Places tiny GTC limit BUY orders at a very low price on each side
   // of ETH/SOL/XRP 5-minute markets — catches panic dumps near $0.
   sniperAssets: (process.env.SNIPER_ASSETS || 'eth,sol,xrp')
-                  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
-  sniperPrice:  parseFloat(process.env.SNIPER_PRICE  || '0.01'), // $ per share
-  sniperShares: parseFloat(process.env.SNIPER_SHARES || '5'),    // shares per side
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+  sniperPrice: parseFloat(process.env.SNIPER_PRICE || '0.01'), // $ per share
+  sniperShares: parseFloat(process.env.SNIPER_SHARES || '5'), // shares per side
 };
 
 // Validation for copy-trade bot
@@ -98,6 +107,10 @@ export function validateMMConfig() {
   if (config.mmTradeSize <= 0) throw new Error('MM_TRADE_SIZE must be > 0');
   if (config.mmSellPrice <= 0 || config.mmSellPrice >= 1)
     throw new Error('MM_SELL_PRICE must be between 0 and 1');
+
+  if (![0, 1, 2].includes(config.polySignatureType)) {
+    throw new Error('POLY_SIGNATURE_TYPE must be one of: 0, 1, 2');
+  }
 }
 
 export default config;

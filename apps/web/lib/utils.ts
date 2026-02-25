@@ -9,3 +9,13 @@ export function nowIso(): string {
 export function trimToSingleLine(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
+
+export function formatUtcTime(value: string, precision: 'minutes' | 'seconds' = 'seconds'): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return precision === 'minutes' ? '--:--' : '--:--:--';
+  }
+
+  const iso = date.toISOString();
+  return precision === 'minutes' ? `${iso.slice(11, 16)}Z` : `${iso.slice(11, 19)}Z`;
+}

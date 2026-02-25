@@ -1,10 +1,15 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import dotenv from 'dotenv';
+
 import { createApiServer } from './server.js';
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = path.resolve(currentDir, '../../..');
+
+dotenv.config({ path: path.resolve(workspaceRoot, '.env') });
+dotenv.config({ path: path.resolve(workspaceRoot, '.env.local'), override: true });
 
 const port = Number(process.env.API_PORT ?? 18789);
 const host = process.env.API_HOST ?? '127.0.0.1';

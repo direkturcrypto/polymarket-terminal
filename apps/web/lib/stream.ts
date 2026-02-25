@@ -18,6 +18,7 @@ export function createStreamConnection(callbacks: StreamCallbacks): () => void {
   let retryTimer: number | null = null;
   let retryAttempt = 0;
   let closed = false;
+  const localToken = process.env.NEXT_PUBLIC_LOCAL_API_TOKEN?.trim();
 
   const connect = () => {
     if (closed) {
@@ -26,7 +27,9 @@ export function createStreamConnection(callbacks: StreamCallbacks): () => void {
 
     callbacks.onStateChange('connecting');
 
-    const url = `${getApiWsUrl().replace(/\/$/, '')}/api/v1/stream`;
+    const streamPath = '/api/v1/stream';
+    const tokenQuery = localToken ? `?localToken=${encodeURIComponent(localToken)}` : '';
+    const url = `${getApiWsUrl().replace(/\/$/, '')}${streamPath}${tokenQuery}`;
     socket = new WebSocket(url);
 
     socket.onopen = () => {

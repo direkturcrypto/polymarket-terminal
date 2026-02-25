@@ -66,6 +66,14 @@ function parseAssetList(raw: string | undefined, fallback: string[]): string[] {
     .filter(Boolean);
 }
 
+function pickString(value: string | undefined, fallback: string | undefined): string {
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return value;
+  }
+
+  return fallback ?? '';
+}
+
 function cloneRuntimeConfig(value: RuntimeConfig): RuntimeConfig {
   return {
     connection: { ...value.connection },
@@ -94,10 +102,10 @@ export class ConfigStore {
     const persistedSecrets = readJsonFile<SecretValues>(this.secretsFilePath);
 
     this.secrets = {
-      privateKey: persistedSecrets?.privateKey ?? env.PRIVATE_KEY,
-      clobApiKey: persistedSecrets?.clobApiKey ?? env.CLOB_API_KEY,
-      clobApiSecret: persistedSecrets?.clobApiSecret ?? env.CLOB_API_SECRET,
-      clobApiPassphrase: persistedSecrets?.clobApiPassphrase ?? env.CLOB_API_PASSPHRASE,
+      privateKey: pickString(persistedSecrets?.privateKey, env.PRIVATE_KEY),
+      clobApiKey: pickString(persistedSecrets?.clobApiKey, env.CLOB_API_KEY),
+      clobApiSecret: pickString(persistedSecrets?.clobApiSecret, env.CLOB_API_SECRET),
+      clobApiPassphrase: pickString(persistedSecrets?.clobApiPassphrase, env.CLOB_API_PASSPHRASE),
     };
 
     const defaults = RuntimeConfigSchema.parse({
@@ -152,14 +160,33 @@ export class ConfigStore {
     });
 
     const persistedConfig = readJsonFile<PersistedConfig>(this.configFilePath);
+    const persistedConnection = persistedConfig?.connection;
+    const persistedCopy = persistedConfig?.copy;
 
     this.runtimeConfig = RuntimeConfigSchema.parse({
       ...defaults,
-      connection: persistedConfig?.connection ?? defaults.connection,
-      copy: persistedConfig?.copy ?? defaults.copy,
-      mm: persistedConfig?.mm ?? defaults.mm,
-      sniper: persistedConfig?.sniper ?? defaults.sniper,
-      risk: persistedConfig?.risk ?? defaults.risk,
+      connection: {
+        ...defaults.connection,
+        ...(persistedConnection ?? {}),
+        proxyWallet: pickString(persistedConnection?.proxyWallet, defaults.connection.proxyWallet),
+      },
+      copy: {
+        ...defaults.copy,
+        ...(persistedCopy ?? {}),
+        traderAddress: pickString(persistedCopy?.traderAddress, defaults.copy.traderAddress),
+      },
+      mm: {
+        ...defaults.mm,
+        ...(persistedConfig?.mm ?? {}),
+      },
+      sniper: {
+        ...defaults.sniper,
+        ...(persistedConfig?.sniper ?? {}),
+      },
+      risk: {
+        ...defaults.risk,
+        ...(persistedConfig?.risk ?? {}),
+      },
       secrets: {
         hasPrivateKey: Boolean(this.secrets.privateKey),
         hasClobApiKey: Boolean(this.secrets.clobApiKey),
@@ -232,6 +259,26 @@ export class ConfigStore {
           : this.runtimeConfig.sniper.dryRun;
 
     return isDry ? 'dry' : 'live';
+  }
+
+  validateBotStart(bot: BotId): void {
+    const missing: string[] = [];
+
+    if (!this.secrets.privateKey) {
+      missing.push('PRIVATE_KEY');
+    }
+
+    if (!this.runtimeConfig.connection.proxyWallet) {
+      missing.push('PROXY_WALLET_ADDRESS');
+    }
+
+    if (bot === 'copy' && !this.runtimeConfig.copy.traderAddress) {
+      missing.push('TRADER_ADDRESS');
+    }
+
+    if (missing.length > 0) {
+      throw new Error(`Cannot start ${bot}: missing ${missing.join(', ')}`);
+    }
   }
 
   toEnv(mode: BotMode): NodeJS.ProcessEnv {

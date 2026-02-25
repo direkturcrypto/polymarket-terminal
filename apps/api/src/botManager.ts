@@ -20,8 +20,30 @@ import type { AuditStore } from './auditStore.js';
 
 const MAX_LOG_HISTORY = 1_000;
 const MAX_ALERT_HISTORY = 500;
+const MAX_LOG_MESSAGE_LENGTH = 600;
+const ESCAPE_CHAR = String.fromCharCode(27);
+const BELL_CHAR = String.fromCharCode(7);
+const ANSI_ESCAPE_PATTERN = new RegExp(`${escapeForRegex(ESCAPE_CHAR)}\\[[0-9;]*[A-Za-z]`, 'g');
+const OSC_ESCAPE_PATTERN = new RegExp(
+  `${escapeForRegex(ESCAPE_CHAR)}\\][^${escapeForRegex(BELL_CHAR)}]*(?:${escapeForRegex(BELL_CHAR)}|${escapeForRegex(ESCAPE_CHAR)}\\\\)`,
+  'g',
+);
+const BLESSED_TAG_PATTERN = /\{\/?[a-z][a-z0-9-]*\}/gi;
 
 type BotControllers = Record<BotId, ProcessBotController>;
+
+interface ClobClientRequestErrorPayload {
+  status?: number;
+  statusText?: string;
+  data?: {
+    error?: string;
+    message?: string;
+  };
+  config?: {
+    method?: string;
+    url?: string;
+  };
+}
 
 function buildScriptPath(workspaceRoot: string, bot: BotId): string {
   const fileName = bot === 'copy' ? 'index.js' : `${bot}.js`;
@@ -79,6 +101,7 @@ export class BotManager {
   }
 
   async start(bot: BotId, explicitMode?: BotMode): Promise<BotStatus> {
+    this.configStore.validateBotStart(bot);
     const mode = this.configStore.resolveMode(bot, explicitMode);
     this.assertStartAllowed(bot, mode);
     this.botModes[bot] = mode;
@@ -109,6 +132,7 @@ export class BotManager {
   }
 
   async restart(bot: BotId, explicitMode?: BotMode): Promise<BotStatus> {
+    this.configStore.validateBotStart(bot);
     const mode = this.configStore.resolveMode(bot, explicitMode);
     this.assertStartAllowed(bot, mode);
     this.botModes[bot] = mode;
@@ -162,6 +186,17 @@ export class BotManager {
     await this.controllers.sniper.stop();
   }
 
+  logSystem(level: LogEntry['level'], message: string, context?: Record<string, unknown>): void {
+    const logEntry = this.createLogEntry({
+      level,
+      message,
+      timestamp: new Date().toISOString(),
+      context,
+    });
+
+    this.pushLogEntry(logEntry);
+  }
+
   private bindControllerEvents(bot: BotId): void {
     this.controllers[bot].subscribe((event) => {
       this.handleControllerEvent(bot, event);
@@ -172,6 +207,18 @@ export class BotManager {
     if (event.type === 'state') {
       const botStatus = this.createBotStatus(bot, event.status);
       this.botStatuses[bot] = botStatus;
+
+      this.pushLogEntry(
+        this.createLogEntry({
+          bot,
+          level: botStatus.state === 'error' ? 'error' : 'info',
+          message:
+            botStatus.state === 'error'
+              ? `State changed to error: ${botStatus.lastError ?? 'unknown error'}`
+              : `State changed to ${botStatus.state}`,
+          timestamp: new Date().toISOString(),
+        }),
+      );
 
       const streamEvent = StreamEventSchema.parse({
         topic: 'bot_state',
@@ -211,13 +258,18 @@ export class BotManager {
     }
 
     const logEntry = LogEntrySchema.parse({
-      id: `${bot}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-      bot,
-      level: event.channel === 'stderr' ? 'error' : 'info',
-      message: event.message,
-      timestamp: event.timestamp,
+      ...this.createLogEntry({
+        bot,
+        level: event.channel === 'stderr' ? 'error' : 'info',
+        message: event.message,
+        timestamp: event.timestamp,
+      }),
     });
 
+    this.pushLogEntry(logEntry);
+  }
+
+  private pushLogEntry(logEntry: LogEntry): void {
     this.logs.push(logEntry);
     if (this.logs.length > MAX_LOG_HISTORY) {
       this.logs.splice(0, this.logs.length - MAX_LOG_HISTORY);
@@ -230,6 +282,25 @@ export class BotManager {
     });
 
     this.streamEmitter.emit('stream', streamEvent);
+  }
+
+  private createLogEntry(input: {
+    level: LogEntry['level'];
+    message: string;
+    timestamp: string;
+    bot?: BotId;
+    context?: Record<string, unknown>;
+  }): LogEntry {
+    const normalized = normalizeLogMessage(input.message);
+
+    return LogEntrySchema.parse({
+      id: `${input.bot ?? 'system'}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      bot: input.bot,
+      level: input.level,
+      message: normalized || '[empty log line]',
+      timestamp: input.timestamp,
+      context: input.context,
+    });
   }
 
   private createBotStatus(
@@ -288,4 +359,85 @@ export class BotManager {
       }
     }
   }
+}
+
+function normalizeLogMessage(message: string): string {
+  const cleaned = message
+    .replace(OSC_ESCAPE_PATTERN, '')
+    .replace(ANSI_ESCAPE_PATTERN, '')
+    .replace(BLESSED_TAG_PATTERN, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const compacted = compactClobClientRequestError(cleaned);
+  const redacted = redactSensitiveValues(compacted);
+  return truncateLogMessage(redacted);
+}
+
+function escapeForRegex(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function compactClobClientRequestError(message: string): string {
+  const marker = '[CLOB Client] request error';
+  if (!message.includes(marker)) {
+    return message;
+  }
+
+  const jsonStart = message.indexOf('{', message.indexOf(marker));
+  if (jsonStart < 0) {
+    return message;
+  }
+
+  try {
+    const payload = JSON.parse(message.slice(jsonStart)) as ClobClientRequestErrorPayload;
+    const method =
+      typeof payload.config?.method === 'string' ? payload.config.method.toUpperCase() : 'REQUEST';
+    const target = summarizeRequestTarget(payload.config?.url);
+    const statusCode = typeof payload.status === 'number' ? String(payload.status) : 'ERR';
+    const statusText = typeof payload.statusText === 'string' ? ` ${payload.statusText}` : '';
+    const reason =
+      typeof payload.data?.error === 'string'
+        ? payload.data.error
+        : typeof payload.data?.message === 'string'
+          ? payload.data.message
+          : 'request failed';
+
+    return `[CLOB Client] ${method} ${target} -> ${statusCode}${statusText}: ${reason}`;
+  } catch {
+    return message;
+  }
+}
+
+function summarizeRequestTarget(url?: string): string {
+  if (!url) {
+    return 'unknown-endpoint';
+  }
+
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
+function redactSensitiveValues(message: string): string {
+  return message
+    .replace(
+      /"([^"\n]*(?:poly_signature|poly_passphrase|poly_api_key|clob_api_key|clob_api_secret|clob_api_passphrase|private_key|api[_-]?key|api[_-]?secret|passphrase|secret|signature)[^"\n]*)"\s*:\s*"[^"]*"/gi,
+      '"$1":"[redacted]"',
+    )
+    .replace(
+      /\b(POLY_SIGNATURE|POLY_PASSPHRASE|POLY_API_KEY|CLOB_API_KEY|CLOB_API_SECRET|CLOB_API_PASSPHRASE|PRIVATE_KEY)\s*([:=])\s*[^,\s}]+/gi,
+      '$1$2[redacted]',
+    );
+}
+
+function truncateLogMessage(message: string): string {
+  if (message.length <= MAX_LOG_MESSAGE_LENGTH) {
+    return message;
+  }
+
+  return `${message.slice(0, MAX_LOG_MESSAGE_LENGTH - 16)}...[truncated]`;
 }

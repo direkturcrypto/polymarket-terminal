@@ -1,40 +1,43 @@
 'use client';
 
-import { useMemo, useState, type RefObject } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
 
 import type { SessionEntry } from '../lib/types';
+import { formatUtcTime } from '../lib/utils';
 import { ToolCard } from './ToolCard';
 
 interface ChatPanelProps {
   session: SessionEntry;
   onSubmitPrompt: (value: string) => Promise<void>;
+  onClearSession: () => void;
   onToggleToolExpanded: (messageId: string, toolId: string) => void;
   inputRef: RefObject<HTMLTextAreaElement | null>;
-}
-
-function formatTime(value: string): string {
-  const date = new Date(value);
-  return `${date.getHours().toString().padStart(2, '0')}:${date
-    .getMinutes()
-    .toString()
-    .padStart(2, '0')}`;
 }
 
 export function ChatPanel({
   session,
   onSubmitPrompt,
+  onClearSession,
   onToggleToolExpanded,
   inputRef,
 }: ChatPanelProps) {
   const [inputValue, setInputValue] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
 
   const canSubmit = inputValue.trim().length > 0 && !submitting;
 
   const sortedMessages = useMemo(() => session.messages, [session.messages]);
+
+  useEffect(() => {
+    const el = transcriptRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [sortedMessages]);
 
   const submit = async () => {
     const value = inputValue.trim();
@@ -51,19 +54,36 @@ export function ChatPanel({
     }
   };
 
+  const clearAssistant = () => {
+    if (window.confirm('Clear the operational assistant for this session?')) {
+      onClearSession();
+    }
+  };
+
   return (
     <section className="panel chatPanel" aria-label="Assistant chat">
       <header className="chatHeader">
-        <h2>Operator Assistant</h2>
+        <div className="chatHeaderTop">
+          <h2>Operational Assistant</h2>
+          <button
+            type="button"
+            className="chatHeaderAction"
+            onClick={clearAssistant}
+            aria-label="Clear operational assistant session"
+            title="Clear assistant session"
+          >
+            Clear Assistant
+          </button>
+        </div>
         <p>Command mode enabled. Use `/help` to list runtime actions.</p>
       </header>
 
-      <div className="chatTranscript" role="log" aria-live="polite">
+      <div className="chatTranscript" role="log" aria-live="polite" ref={transcriptRef}>
         {sortedMessages.map((message) => (
           <article key={message.id} className={`chatMessage is-${message.role}`}>
             <div className="chatMeta">
               <span>{message.role}</span>
-              <time>{formatTime(message.createdAt)}</time>
+              <time>{formatUtcTime(message.createdAt, 'minutes')}</time>
             </div>
 
             <div className="chatBubble">
@@ -110,9 +130,19 @@ export function ChatPanel({
 
         <div className="composerFooter">
           <span>Ctrl/Cmd+Enter to send</span>
-          <button type="submit" disabled={!canSubmit}>
-            {submitting ? 'Running...' : 'Send'}
-          </button>
+          <div className="composerActions">
+            <button
+              type="button"
+              className="composerClear"
+              onClick={clearAssistant}
+              aria-label="Clear operational assistant session"
+            >
+              Clear Assistant
+            </button>
+            <button type="submit" disabled={!canSubmit}>
+              {submitting ? 'Running...' : 'Send'}
+            </button>
+          </div>
         </div>
       </form>
     </section>

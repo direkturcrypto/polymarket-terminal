@@ -46,6 +46,7 @@ const AlertsQuerySchema = z.object({
 });
 
 const WS_OPEN = 1;
+const QUIET_API_PATHS = new Set(['/api/v1/health', '/api/v1/logs', '/api/v1/stream']);
 
 interface TrackedSocket {
   readyState: number;
@@ -78,6 +79,13 @@ interface AlertsQuery {
 }
 
 interface LocalTokenHeader {
+  'x-local-token'?: string | string[];
+}
+
+interface LocalTokenQuery {
+  token?: string | string[];
+  localToken?: string | string[];
+  local_token?: string | string[];
   'x-local-token'?: string | string[];
 }
 
@@ -167,9 +175,58 @@ function parseBotParam(params: unknown): BotId {
   return parseBotId((params as BotParam).bot);
 }
 
-function parseLocalToken(headers: unknown): string | undefined {
+function parseTokenValue(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === 'string') {
+        const trimmed = item.trim();
+        if (trimmed.length > 0) {
+          return trimmed;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function parseLocalToken(headers: unknown, query: unknown): string | undefined {
   const tokenHeader = (headers as LocalTokenHeader)['x-local-token'];
-  return normalizeTokenHeader(tokenHeader);
+  const headerToken = normalizeTokenHeader(tokenHeader);
+  if (headerToken) {
+    return headerToken;
+  }
+
+  if (!query || typeof query !== 'object') {
+    return undefined;
+  }
+
+  const queryObject = query as LocalTokenQuery;
+
+  return (
+    parseTokenValue(queryObject.localToken) ??
+    parseTokenValue(queryObject.local_token) ??
+    parseTokenValue(queryObject.token) ??
+    parseTokenValue(queryObject['x-local-token'])
+  );
+}
+
+function stripQueryFromUrl(url: string): string {
+  const queryIndex = url.indexOf('?');
+  return queryIndex >= 0 ? url.slice(0, queryIndex) : url;
+}
+
+function shouldTraceRequest(method: string, pathName: string): boolean {
+  if (method === 'OPTIONS') {
+    return false;
+  }
+
+  return !QUIET_API_PATHS.has(pathName);
 }
 
 function isSocketOpen(socket: TrackedSocket): boolean {
@@ -240,11 +297,17 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
   const app = Fastify({
     logger: true,
   });
+  const verboseApiLogs = process.env.API_VERBOSE !== 'false';
 
   const dataDirectory = path.resolve(options.workspaceRoot, 'data', 'api');
   const configStore = new ConfigStore({ dataDir: dataDirectory });
   const auditStore = new AuditStore({ dataDir: dataDirectory });
   const botManager = new BotManager(configStore, options.workspaceRoot, auditStore);
+
+  botManager.logSystem('info', 'API runtime initialized', {
+    workspaceRoot: options.workspaceRoot,
+    dataDirectory,
+  });
 
   const socketClients = new Set<TrackedSocket>();
 
@@ -276,7 +339,13 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
   await app.register(websocket);
 
   app.addHook('onRequest', async (request, reply) => {
-    if (request.method === 'OPTIONS' || request.url === '/api/v1/health') {
+    const pathName = stripQueryFromUrl(request.url);
+
+    if (verboseApiLogs && shouldTraceRequest(request.method, pathName)) {
+      botManager.logSystem('debug', `Request ${request.method} ${pathName}`);
+    }
+
+    if (request.method === 'OPTIONS' || pathName === '/api/v1/health') {
       return;
     }
 
@@ -285,11 +354,28 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
       return;
     }
 
-    const token = parseLocalToken(request.headers);
+    const token = parseLocalToken(request.headers, request.query);
 
     if (token !== requiredToken) {
+      botManager.logSystem('warn', `Unauthorized request ${request.method} ${pathName}`);
       return sendErrorAndReturn(reply, 401, 'UNAUTHORIZED', 'Missing or invalid local API token');
     }
+  });
+
+  app.addHook('onResponse', async (request, reply) => {
+    if (!verboseApiLogs) {
+      return;
+    }
+
+    const pathName = stripQueryFromUrl(request.url);
+    if (!shouldTraceRequest(request.method, pathName)) {
+      return;
+    }
+
+    const level: 'debug' | 'warn' | 'error' =
+      reply.statusCode >= 500 ? 'error' : reply.statusCode >= 400 ? 'warn' : 'debug';
+
+    botManager.logSystem(level, `Response ${request.method} ${pathName} -> ${reply.statusCode}`);
   });
 
   app.get('/api/v1/health', async () => {
@@ -318,8 +404,17 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
           keys: Object.keys((request.body as Record<string, unknown>) ?? {}),
         },
       });
+
+      botManager.logSystem('info', 'Config updated via API', {
+        keys: Object.keys((request.body as Record<string, unknown>) ?? {}),
+      });
+
       return nextConfig;
     } catch (error) {
+      botManager.logSystem(
+        'error',
+        `Config update failed: ${getRouteErrorMessage(error, 'unknown')}`,
+      );
       return sendErrorAndReturn(
         reply,
         400,
@@ -344,12 +439,26 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
   });
 
   app.post('/api/v1/bots/:bot/start', async (request, reply) => {
+    let botLabel = 'unknown';
     try {
       const bot = parseBotParam(request.params);
+      botLabel = bot;
       const parsedBody = parseStartStopBody(request.body);
       const mode = parsedBody.mode;
-      return await botManager.start(bot, mode);
+      botManager.logSystem('info', `Start requested for ${bot}`, { mode: mode ?? 'auto' });
+
+      const status = await botManager.start(bot, mode);
+      botManager.logSystem('success', `Started ${bot}`, {
+        mode: status.mode,
+        state: status.state,
+      });
+
+      return status;
     } catch (error) {
+      botManager.logSystem(
+        'error',
+        `Start failed for ${botLabel}: ${getRouteErrorMessage(error, 'Failed to start bot')}`,
+      );
       return sendErrorAndReturn(
         reply,
         400,
@@ -360,10 +469,20 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
   });
 
   app.post('/api/v1/bots/:bot/stop', async (request, reply) => {
+    let botLabel = 'unknown';
     try {
       const bot = parseBotParam(request.params);
-      return await botManager.stop(bot);
+      botLabel = bot;
+      botManager.logSystem('info', `Stop requested for ${bot}`);
+
+      const status = await botManager.stop(bot);
+      botManager.logSystem('success', `Stopped ${bot}`);
+      return status;
     } catch (error) {
+      botManager.logSystem(
+        'error',
+        `Stop failed for ${botLabel}: ${getRouteErrorMessage(error, 'Failed to stop bot')}`,
+      );
       return sendErrorAndReturn(
         reply,
         400,
@@ -374,12 +493,26 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
   });
 
   app.post('/api/v1/bots/:bot/restart', async (request, reply) => {
+    let botLabel = 'unknown';
     try {
       const bot = parseBotParam(request.params);
+      botLabel = bot;
       const parsedBody = parseStartStopBody(request.body);
       const mode = parsedBody.mode;
-      return await botManager.restart(bot, mode);
+      botManager.logSystem('info', `Restart requested for ${bot}`, { mode: mode ?? 'auto' });
+
+      const status = await botManager.restart(bot, mode);
+      botManager.logSystem('success', `Restarted ${bot}`, {
+        mode: status.mode,
+        state: status.state,
+      });
+
+      return status;
     } catch (error) {
+      botManager.logSystem(
+        'error',
+        `Restart failed for ${botLabel}: ${getRouteErrorMessage(error, 'Failed to restart bot')}`,
+      );
       return sendErrorAndReturn(
         reply,
         400,
@@ -422,6 +555,8 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
   });
 
   app.post('/api/v1/bots/kill-switch', async () => {
+    botManager.logSystem('warn', 'Kill switch armed via API');
+
     configStore.updateRuntimeConfig({
       risk: {
         killSwitchArmed: true,
@@ -441,6 +576,8 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
   });
 
   app.post('/api/v1/bots/kill-switch/reset', async () => {
+    botManager.logSystem('info', 'Kill switch reset requested via API');
+
     const config = configStore.updateRuntimeConfig({
       risk: {
         killSwitchArmed: false,
@@ -505,14 +642,24 @@ export async function createApiServer(options: CreateApiServerOptions): Promise<
       const socket = asTrackedSocket(connection);
       handleSocketConnection(socket, socketClients);
       sendBotStateSnapshot(socket, botManager);
+      botManager.logSystem('debug', 'WebSocket stream client connected');
+
+      socket.on('close', () => {
+        botManager.logSystem('debug', 'WebSocket stream client disconnected');
+      });
     } catch (error) {
       app.log.error(error);
+      botManager.logSystem(
+        'error',
+        `WebSocket stream connection failed: ${getRouteErrorMessage(error, 'unknown')}`,
+      );
     }
   });
 
   const heartbeat = setupSocketHeartbeat(socketClients);
 
   app.addHook('onClose', async () => {
+    botManager.logSystem('info', 'API server shutting down');
     clearInterval(heartbeat);
     unsubscribe();
     closeSocketClients(socketClients);

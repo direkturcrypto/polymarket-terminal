@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { atomicWriteJson } from './fileStore.js';
 import { ConfigStore } from './configStore.js';
 
 const tempDirectories: string[] = [];
@@ -87,5 +88,65 @@ describe('ConfigStore persistence', () => {
 
     expect(secrets.hasClobApiSecret).toBe(true);
     expect(secrets).not.toHaveProperty('clobApiSecret');
+  });
+
+  it('validates required bot start inputs before launch', () => {
+    const dataDir = createTempDirectory();
+    const store = new ConfigStore({
+      dataDir,
+      env: {
+        ...process.env,
+        POLYGON_RPC_URL: 'https://polygon-rpc.com',
+        PRIVATE_KEY: '',
+        PROXY_WALLET_ADDRESS: '',
+      },
+    });
+
+    expect(() => store.validateBotStart('mm')).toThrow('Cannot start mm');
+
+    store.updateRuntimeConfig({
+      connection: {
+        proxyWallet: '0xproxy',
+      },
+      secrets: {
+        privateKey: '0xprivatekey',
+      },
+    });
+
+    expect(() => store.validateBotStart('mm')).not.toThrow();
+  });
+
+  it('falls back to .env values when persisted values are blank', () => {
+    const dataDir = createTempDirectory();
+
+    atomicWriteJson(path.resolve(dataDir, 'runtime-config.json'), {
+      connection: {
+        proxyWallet: '',
+        polygonRpcUrl: 'https://polygon-rpc.com',
+      },
+      copy: {
+        traderAddress: '',
+      },
+    });
+
+    atomicWriteJson(path.resolve(dataDir, 'runtime-secrets.json'), {
+      privateKey: '',
+    });
+
+    const store = new ConfigStore({
+      dataDir,
+      env: {
+        ...process.env,
+        PRIVATE_KEY: '0xfromenv',
+        PROXY_WALLET_ADDRESS: '0xproxyfromenv',
+        TRADER_ADDRESS: '0xtraderfromenv',
+        POLYGON_RPC_URL: 'https://polygon-rpc.com',
+      },
+    });
+
+    const config = store.getRuntimeConfig();
+    expect(config.connection.proxyWallet).toBe('0xproxyfromenv');
+    expect(config.copy.traderAddress).toBe('0xtraderfromenv');
+    expect(store.toEnv('dry').PRIVATE_KEY).toBe('0xfromenv');
   });
 });

@@ -11,6 +11,8 @@ import type {
 } from './types.js';
 
 const STOP_TIMEOUT_MS = 7_000;
+const STARTUP_TIMEOUT_MS = 4_000;
+const STARTUP_POLL_INTERVAL_MS = 50;
 
 export class ProcessBotController implements BotController<
   ProcessBotControllerStartConfig,
@@ -19,6 +21,7 @@ export class ProcessBotController implements BotController<
   private readonly options: ProcessBotControllerOptions;
   private readonly emitter = new EventEmitter();
   private process: ChildProcess | null = null;
+  private lastStderrMessage: string | undefined;
   private statusSnapshot: BotControllerStatus = {
     state: 'idle',
     updatedAt: new Date().toISOString(),
@@ -36,6 +39,7 @@ export class ProcessBotController implements BotController<
     }
 
     this.stoppingRequested = false;
+    this.lastStderrMessage = undefined;
     this.updateStatus('starting');
 
     const child = spawn(process.execPath, [this.options.scriptPath], {
@@ -76,8 +80,9 @@ export class ProcessBotController implements BotController<
 
     child.once('exit', (code, signal) => {
       const isFailure = !this.stoppingRequested && code !== 0;
+      const stderrHint = this.lastStderrMessage ? ` | ${this.lastStderrMessage}` : '';
       const failureReason = isFailure
-        ? `${this.options.botId} exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`
+        ? `${this.options.botId} exited with code=${code ?? 'null'} signal=${signal ?? 'null'}${stderrHint}`
         : undefined;
 
       this.process = null;
@@ -90,6 +95,13 @@ export class ProcessBotController implements BotController<
 
       this.updateStatus('idle');
     });
+
+    try {
+      await this.waitForStartupOutcome();
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -148,6 +160,10 @@ export class ProcessBotController implements BotController<
       .filter(Boolean);
 
     for (const message of lines) {
+      if (channel === 'stderr') {
+        this.lastStderrMessage = message;
+      }
+
       this.emitter.emit('event', {
         type: 'log',
         channel,
@@ -168,5 +184,32 @@ export class ProcessBotController implements BotController<
       type: 'state',
       status: this.status(),
     } satisfies ProcessBotControllerEvent);
+  }
+
+  private async waitForStartupOutcome(): Promise<void> {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < STARTUP_TIMEOUT_MS) {
+      const snapshot = this.statusSnapshot;
+
+      if (snapshot.state === 'running') {
+        return;
+      }
+
+      if (snapshot.state === 'error' || snapshot.state === 'idle') {
+        throw new Error(snapshot.lastError ?? `${this.options.botId} failed to start`);
+      }
+
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, STARTUP_POLL_INTERVAL_MS);
+      });
+    }
+
+    const snapshot = this.statusSnapshot;
+    if (snapshot.state === 'running') {
+      return;
+    }
+
+    throw new Error(snapshot.lastError ?? `${this.options.botId} startup timed out`);
   }
 }

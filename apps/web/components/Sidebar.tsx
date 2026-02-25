@@ -1,10 +1,13 @@
-import type { SessionEntry } from '../lib/types';
+import type { BotStatusMap, LogBotFilter, SessionEntry } from '../lib/types';
 
 interface SidebarProps {
+  bots: BotStatusMap;
+  logBotFilter: LogBotFilter;
   sessions: SessionEntry[];
   currentSessionId: string;
   searchQuery: string;
   onSearchQueryChange: (value: string) => void;
+  onSelectLogBot: (value: LogBotFilter) => void;
   onCreateSession: () => void;
   onSelectSession: (sessionId: string) => void;
   onTogglePin: (sessionId: string) => void;
@@ -12,6 +15,13 @@ interface SidebarProps {
   mobileOpen: boolean;
   onCloseMobile: () => void;
 }
+
+const BOT_MENU_OPTIONS: Array<{ value: LogBotFilter; label: string }> = [
+  { value: 'all', label: 'All Logs' },
+  { value: 'copy', label: 'Copy' },
+  { value: 'mm', label: 'MM' },
+  { value: 'sniper', label: 'Sniper' },
+];
 
 function filterSessions(sessions: SessionEntry[], query: string): SessionEntry[] {
   if (!query.trim()) {
@@ -27,6 +37,15 @@ function filterSessions(sessions: SessionEntry[], query: string): SessionEntry[]
     const lastMessage = session.messages[session.messages.length - 1]?.content ?? '';
     return lastMessage.toLowerCase().includes(normalized);
   });
+}
+
+function summarizeRunningBots(bots: BotStatusMap): string {
+  const running = Object.values(bots).filter((bot) => bot.state === 'running').length;
+  if (running === 0) {
+    return 'idle';
+  }
+
+  return `${running} running`;
 }
 
 function SessionListSection({
@@ -98,7 +117,7 @@ export function Sidebar(props: SidebarProps) {
     <aside className={`sidebar ${props.mobileOpen ? 'isOpen' : ''}`}>
       <div className="brand">
         <strong>Polymarket</strong>
-        <span>Control Plane</span>
+        <span>Mission Roster</span>
       </div>
 
       <div className="sidebarActions">
@@ -117,6 +136,42 @@ export function Sidebar(props: SidebarProps) {
       </div>
 
       <div className="sessionScroll">
+        <section className="botMenuSection" aria-label="Bot log filters">
+          <h3>Bot Logs</h3>
+          <div className="botMenuList">
+            {BOT_MENU_OPTIONS.map((option) => {
+              const active = option.value === props.logBotFilter;
+              const botState =
+                option.value === 'all'
+                  ? undefined
+                  : props.bots[option.value as Exclude<LogBotFilter, 'all' | 'api'>].state;
+              const botMode =
+                option.value === 'all'
+                  ? undefined
+                  : props.bots[option.value as Exclude<LogBotFilter, 'all' | 'api'>].mode;
+              const meta =
+                option.value === 'all'
+                  ? summarizeRunningBots(props.bots)
+                  : `${botState} · ${botMode}`;
+
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`botMenuItem ${active ? 'isActive' : ''} ${botState ? `is-${botState}` : ''}`}
+                  onClick={() => {
+                    props.onSelectLogBot(option.value);
+                    props.onCloseMobile();
+                  }}
+                >
+                  <span className="botMenuName">{option.label}</span>
+                  <span className="botMenuMeta">{meta}</span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
         <SessionListSection
           heading="Pinned"
           sessions={pinned}

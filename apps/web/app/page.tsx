@@ -7,8 +7,10 @@ import { CommandPalette } from '../components/CommandPalette';
 import { RightPanel } from '../components/RightPanel';
 import { Sidebar } from '../components/Sidebar';
 import { TopNav } from '../components/TopNav';
+import { getAlerts, getHealth, getLogs } from '../lib/api';
 import { createStreamConnection } from '../lib/stream';
 import { useAppStore } from '../lib/store';
+import { formatUtcTime } from '../lib/utils';
 
 export default function Page() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -20,6 +22,7 @@ export default function Page() {
   const connectionState = useAppStore((state) => state.connectionState);
   const commandPaletteOpen = useAppStore((state) => state.commandPaletteOpen);
   const rightPanelOpen = useAppStore((state) => state.rightPanelOpen);
+  const logBotFilter = useAppStore((state) => state.logBotFilter);
   const theme = useAppStore((state) => state.theme);
   const bots = useAppStore((state) => state.bots);
   const logs = useAppStore((state) => state.logs);
@@ -31,9 +34,11 @@ export default function Page() {
   const setConnectionState = useAppStore((state) => state.setConnectionState);
   const createSession = useAppStore((state) => state.createSession);
   const selectSession = useAppStore((state) => state.selectSession);
+  const setLogBotFilter = useAppStore((state) => state.setLogBotFilter);
   const togglePinSession = useAppStore((state) => state.togglePinSession);
   const toggleArchiveSession = useAppStore((state) => state.toggleArchiveSession);
   const submitPrompt = useAppStore((state) => state.submitPrompt);
+  const clearCurrentSession = useAppStore((state) => state.clearCurrentSession);
   const toggleToolExpanded = useAppStore((state) => state.toggleToolExpanded);
   const ingestStreamEvent = useAppStore((state) => state.ingestStreamEvent);
   const toggleRightPanel = useAppStore((state) => state.toggleRightPanel);
@@ -42,6 +47,14 @@ export default function Page() {
   const currentSession = useMemo(() => {
     return sessions.find((session) => session.id === currentSessionId) ?? sessions[0];
   }, [sessions, currentSessionId]);
+
+  const botList = useMemo(() => Object.values(bots), [bots]);
+  const runningBots = useMemo(
+    () => botList.filter((bot) => bot.state === 'running').length,
+    [botList],
+  );
+  const errorBots = useMemo(() => botList.filter((bot) => bot.state === 'error').length, [botList]);
+  const dryBots = useMemo(() => botList.filter((bot) => bot.mode === 'dry').length, [botList]);
 
   useEffect(() => {
     hydrateFromStorage();
@@ -64,6 +77,46 @@ export default function Page() {
 
     return disconnect;
   }, [setConnectionState, ingestStreamEvent]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadRuntimeSnapshot = async () => {
+      try {
+        const [health, logsResponse, alertsResponse] = await Promise.all([
+          getHealth(),
+          getLogs(200),
+          getAlerts(100),
+        ]);
+
+        if (cancelled) {
+          return;
+        }
+
+        useAppStore.setState((state) => {
+          const nextBots = { ...state.bots };
+
+          for (const status of health.bots) {
+            nextBots[status.bot] = status;
+          }
+
+          return {
+            bots: nextBots,
+            logs: logsResponse.logs.slice(-300),
+            alerts: alertsResponse.alerts.slice(-100),
+          };
+        });
+      } catch (error) {
+        console.error('Failed to load initial runtime snapshot', error);
+      }
+    };
+
+    void loadRuntimeSnapshot();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -106,10 +159,13 @@ export default function Page() {
       />
 
       <Sidebar
+        bots={bots}
+        logBotFilter={logBotFilter}
         sessions={sessions}
         currentSessionId={currentSession.id}
         searchQuery={searchQuery}
         onSearchQueryChange={setSearchQuery}
+        onSelectLogBot={setLogBotFilter}
         onCreateSession={createSession}
         onSelectSession={selectSession}
         onTogglePin={togglePinSession}
@@ -132,25 +188,59 @@ export default function Page() {
         <div className={`contentGrid ${rightPanelOpen ? '' : 'isRightPanelHidden'}`}>
           <main className="mainArea">
             <section className="panel workspacePanel">
-              <h2>Bot Control Center</h2>
+              <header className="workspaceHeader">
+                <div className="workspaceHeaderLeft">
+                  <h2>Bot Control Center</h2>
+                </div>
+
+                <div className="summaryStrip" aria-label="Runtime summary">
+                  <article className="summaryChip">
+                    <span>Running</span>
+                    <strong>{runningBots}</strong>
+                  </article>
+                  <article className="summaryChip">
+                    <span>Dry</span>
+                    <strong>{dryBots}</strong>
+                  </article>
+                  <article className={`summaryChip ${errorBots > 0 ? 'isError' : ''}`}>
+                    <span>Errors</span>
+                    <strong>{errorBots}</strong>
+                  </article>
+                </div>
+              </header>
+
               <div className="botQuickGrid">
-                {Object.values(bots).map((bot) => (
+                {botList.map((bot) => (
                   <article key={bot.bot} className={`quickBotCard is-${bot.state}`}>
                     <header>
                       <h3>{bot.bot.toUpperCase()}</h3>
-                      <span>{bot.state}</span>
+                      <span className="quickBotBadge">{bot.state}</span>
                     </header>
-                    <p>
+                    <p className="quickBotMeta">
                       Mode <strong>{bot.mode}</strong>
+                      {'  ·  '}
+                      {formatUtcTime(bot.updatedAt, 'minutes')}
                     </p>
                     <div className="quickBotActions">
                       <button
                         type="button"
+                        className="quickActionPrimary"
                         onClick={() => void submitPrompt(`/start ${bot.bot} dry`)}
                       >
-                        Start Dry
+                        Dry
                       </button>
-                      <button type="button" onClick={() => void submitPrompt(`/stop ${bot.bot}`)}>
+                      <button
+                        type="button"
+                        className="quickActionLive"
+                        onClick={() => void submitPrompt(`/start ${bot.bot} live`)}
+                      >
+                        Live
+                      </button>
+                      <button
+                        type="button"
+                        className="quickActionGhost"
+                        onClick={() => void submitPrompt(`/stop ${bot.bot}`)}
+                      >
                         Stop
                       </button>
                     </div>
@@ -162,12 +252,22 @@ export default function Page() {
             <ChatPanel
               session={currentSession}
               onSubmitPrompt={submitPrompt}
+              onClearSession={clearCurrentSession}
               onToggleToolExpanded={toggleToolExpanded}
               inputRef={inputRef}
             />
           </main>
 
-          {rightPanelOpen ? <RightPanel bots={bots} logs={logs} alerts={alerts} /> : null}
+          {rightPanelOpen ? (
+            <RightPanel
+              bots={bots}
+              logs={logs}
+              alerts={alerts}
+              connectionState={connectionState}
+              logBotFilter={logBotFilter}
+              onLogBotFilterChange={setLogBotFilter}
+            />
+          ) : null}
         </div>
       </div>
 

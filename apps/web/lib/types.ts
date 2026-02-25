@@ -38,6 +38,8 @@ export type ThemeName = 'dark' | 'oled' | 'cobalt';
 
 export type StreamConnectionState = 'connecting' | 'connected' | 'disconnected';
 
+export type LogBotFilter = 'all' | 'api' | 'copy' | 'mm' | 'sniper';
+
 export interface AppSnapshot {
   sessions: SessionEntry[];
   currentSessionId: string;
