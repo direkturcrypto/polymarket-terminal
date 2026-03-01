@@ -118,6 +118,9 @@ async function _doExecSafeCall(to, data, description = '') {
     if (description) logger.info(`MM: exec safe tx — ${description}`);
 
     let lastErr;
+    // Track gas price multiplier for replacement transactions
+    let gasMultiplier = 1;
+
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
             const provider = await getPolygonProvider();
@@ -149,9 +152,15 @@ async function _doExecSafeCall(to, data, description = '') {
             // Polygon requires maxPriorityFeePerGas ≥ 25 Gwei.
             // Some RPC nodes (e.g. lava.build) return a stale low estimate, so we enforce a floor.
             const feeData = await provider.getFeeData();
-            const MIN_TIP = ethers.utils.parseUnits('30', 'gwei');
-            const gasTip = feeData.maxPriorityFeePerGas?.gt(MIN_TIP) ? feeData.maxPriorityFeePerGas : MIN_TIP;
-            const gasFeeCap = feeData.maxFeePerGas ?? ethers.utils.parseUnits('500', 'gwei');
+
+            // Increase gas price on retry to replace pending transaction
+            // Multiplier: 1x → 2x → 4x on subsequent attempts
+            const MIN_TIP = ethers.utils.parseUnits('30', 'gwei').mul(Math.ceil(gasMultiplier));
+            const gasTip = feeData.maxPriorityFeePerGas?.mul(Math.ceil(gasMultiplier)).gt(MIN_TIP)
+                ? feeData.maxPriorityFeePerGas.mul(Math.ceil(gasMultiplier))
+                : MIN_TIP;
+            const gasFeeCap = (feeData.maxFeePerGas ?? ethers.utils.parseUnits('500', 'gwei'))
+                .mul(Math.ceil(gasMultiplier * 1.5));
 
             const tx = await safe.execTransaction(
                 to, 0, data, 0, 0, 0, 0,
@@ -169,7 +178,14 @@ async function _doExecSafeCall(to, data, description = '') {
             const friendly = parseOnchainError(err);
 
             if (attempt < MAX_RETRIES) {
-                logger.warn(`MM: transaction failed (attempt ${attempt}/${MAX_RETRIES}): ${friendly} — retrying in ${RETRY_DELAY / 1000}s...`);
+                // Increase gas multiplier for replacement transaction
+                if (err?.message?.includes('replacement transaction underpriced') ||
+                    err?.message?.includes('Gas price too low to replace')) {
+                    gasMultiplier *= 2;
+                    logger.warn(`MM: transaction failed (attempt ${attempt}/${MAX_RETRIES}): ${friendly} — increasing gas ${gasMultiplier}x and retrying...`);
+                } else {
+                    logger.warn(`MM: transaction failed (attempt ${attempt}/${MAX_RETRIES}): ${friendly} — retrying in ${RETRY_DELAY / 1000}s...`);
+                }
                 await sleep(RETRY_DELAY);
             }
         }
