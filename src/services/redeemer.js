@@ -83,7 +83,8 @@ async function redeemPosition(conditionId) {
         const label = conditionId.slice(0, 12) + '...';
         logger.info(`Redeeming position: ${label}`);
         const receipt = await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`);
-        logger.success(`Redeemed in block ${receipt.blockNumber}`);
+        const txHash = receipt.transactionHash;
+        logger.success(`Redeemed in block ${receipt.blockNumber} | tx: ${txHash}`);
         return true;
     } catch (err) {
         logger.error(`Failed to redeem: ${err.message}`);
@@ -167,10 +168,13 @@ export async function checkAndRedeemPositions() {
                 if (success) {
                     removePosition(position.conditionId);
                     logger.money(`Redeemed: ${position.market} → USDC recovered`);
+                } else {
+                    logger.warn(`Redeem failed for ${position.market}, will retry next interval — continuing to next position...`);
                 }
             }
         } catch (err) {
             logger.error(`Error checking ${position.market}:`, err.message);
+            logger.info(`Continuing to next position...`);
         }
     }
 }
