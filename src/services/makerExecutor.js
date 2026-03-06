@@ -1,6 +1,6 @@
 /**
  * makerExecutor.js
- * Buy Low, Sell High Market Maker — no splitPosition.
+ * Buy Low, Sell High Market Maker — no splitPosition, no cut-loss.
  *
  * Flow:
  *   1. Place concurrent limit BUY on UP + DOWN at makerBuyPrice (e.g. 2c)
@@ -9,8 +9,9 @@
  *      a. Immediately place limit SELL for filled shares at makerSellPrice (e.g. 3c)
  *      b. Cancel the other side's buy order
  *   4. Partial fills → partial sells placed immediately
- *   5. Monitor sell orders until all filled or cut-loss
- *   6. Cut-loss: market sell remaining tokens
+ *   5. Monitor sell orders until filled or market expires
+ *   6. No cut-loss — worst case is losing buy cost (2c/share) on wrong side,
+ *      or gaining $1/share if on winning side and sell doesn't fill
  */
 
 import { Side, OrderType } from '@polymarket/clob-client';
@@ -75,31 +76,6 @@ async function cancelOrder(orderId) {
     } catch (err) {
         logger.warn('MAKER cancel order error:', err.message);
         return false;
-    }
-}
-
-async function marketSell(tokenId, shares, tickSize, negRisk) {
-    if (config.dryRun) {
-        try {
-            const mp = await getClient().getMidpoint(tokenId);
-            const price = parseFloat(mp?.mid ?? mp ?? '0') || 0;
-            return { success: true, fillPrice: price };
-        } catch {
-            return { success: true, fillPrice: 0 };
-        }
-    }
-    const client = getClient();
-    try {
-        const res = await client.createAndPostMarketOrder(
-            { tokenID: tokenId, side: Side.SELL, amount: shares, price: 0.01 },
-            { tickSize, negRisk },
-            OrderType.FOK,
-        );
-        if (!res?.success) return { success: false, fillPrice: 0 };
-        return { success: true, fillPrice: parseFloat(res.price || '0') };
-    } catch (err) {
-        logger.error('MAKER market sell error:', err.message);
-        return { success: false, fillPrice: 0 };
     }
 }
 
@@ -197,7 +173,7 @@ export async function executeMakerStrategy(market) {
 
     activePositions.set(conditionId, pos);
 
-    // ── 3. Monitor buy orders (concurrent multi-thread style) ────
+    // ── 3. Monitor buy → sell (concurrent) ───────────────────────
     try {
         await monitorBuyPhase(pos, tag, sim);
         await monitorSellPhase(pos, tag, sim);
@@ -208,7 +184,16 @@ export async function executeMakerStrategy(market) {
     // ── Final P&L ────────────────────────────────────────────────
     const pnl = pos.totalRevenue - pos.totalCost;
     const sign = pnl >= 0 ? '+' : '';
-    logger.money(`MAKER${tag}: ${sim}strategy complete | cost $${pos.totalCost.toFixed(4)} | revenue $${pos.totalRevenue.toFixed(4)} | P&L ${sign}$${pnl.toFixed(4)}`);
+
+    if (pos.status === 'expired-holding') {
+        // Position held to expiry — will resolve on-chain
+        const side = pos[pos.winner];
+        logger.info(`MAKER${tag}: ${sim}holding ${side.buyFilled.toFixed(2)} ${pos.winner.toUpperCase()} shares to resolution`);
+        logger.info(`MAKER${tag}: ${sim}if winning side → payout $${side.buyFilled.toFixed(2)} (cost $${pos.totalCost.toFixed(4)})`);
+        logger.info(`MAKER${tag}: ${sim}if losing side  → payout $0 (loss $${pos.totalCost.toFixed(4)})`);
+    } else {
+        logger.money(`MAKER${tag}: ${sim}strategy complete | cost $${pos.totalCost.toFixed(4)} | revenue $${pos.totalRevenue.toFixed(4)} | P&L ${sign}$${pnl.toFixed(4)}`);
+    }
 
     activePositions.delete(conditionId);
 }
@@ -216,7 +201,7 @@ export async function executeMakerStrategy(market) {
 // ── Buy phase: monitor both sides concurrently ───────────────────────────────
 
 async function monitorBuyPhase(pos, tag, sim) {
-    const { makerBuyPrice, makerSellPrice, makerMonitorMs, makerCutLossTime } = config;
+    const { makerBuyPrice, makerSellPrice, makerMonitorMs } = config;
 
     // Run two concurrent monitors — first full fill wins
     const monitorSide = async (sideKey) => {
@@ -229,11 +214,8 @@ async function monitorBuyPhase(pos, tag, sim) {
         while (!pos.winner) {
             const msLeft = new Date(pos.endTime).getTime() - Date.now();
 
-            // Cut-loss check
-            if (msLeft <= makerCutLossTime * 1000) {
-                logger.warn(`MAKER${tag}: buy phase cut-loss (${Math.round(msLeft / 1000)}s left) — cancelling buy orders`);
-                break;
-            }
+            // Market expired — buy orders expire naturally
+            if (msLeft <= 0) break;
 
             // Check fill
             let fill;
@@ -295,35 +277,27 @@ async function monitorBuyPhase(pos, tag, sim) {
         monitorSide('down'),
     ]);
 
-    // If no winner (cut-loss), cancel all remaining buy orders
+    // If no winner (market expired without fills)
     if (!pos.winner) {
-        pos.status = 'cut-buy';
-        for (const key of ['up', 'down']) {
-            const side = pos[key];
-            if (side.buyOrderId && !side.cancelled) {
-                await cancelOrder(side.buyOrderId);
-                side.cancelled = true;
-            }
-        }
-        // If any partial fills exist, still process sells
+        // Check if any partial fills exist
         const anyFill = pos.up.buyFilled > 0 || pos.down.buyFilled > 0;
         if (anyFill) {
             pos.winner = pos.up.buyFilled >= pos.down.buyFilled ? 'up' : 'down';
             pos.status = 'selling';
-            logger.warn(`MAKER${tag}: partial fill — selling ${pos.winner.toUpperCase()} ${pos[pos.winner].buyFilled.toFixed(2)} shares`);
+            logger.info(`MAKER${tag}: partial fill — monitoring sell for ${pos.winner.toUpperCase()} ${pos[pos.winner].buyFilled.toFixed(2)} shares`);
         } else {
             pos.status = 'done';
-            logger.warn(`MAKER${tag}: no fills during buy phase — exiting with $0 loss`);
+            logger.info(`MAKER${tag}: no fills — buy orders expired naturally, $0 loss`);
         }
     }
 }
 
-// ── Sell phase: monitor all sell orders ───────────────────────────────────────
+// ── Sell phase: monitor sell orders until filled or market expires ────────────
 
 async function monitorSellPhase(pos, tag, sim) {
-    if (pos.status === 'done') return; // nothing to sell
+    if (pos.status === 'done') return;
 
-    const { makerSellPrice, makerMonitorMs, makerCutLossTime } = config;
+    const { makerSellPrice, makerMonitorMs } = config;
     const winnerKey = pos.winner;
     if (!winnerKey) return;
 
@@ -334,13 +308,6 @@ async function monitorSellPhase(pos, tag, sim) {
 
     while (true) {
         const msLeft = new Date(pos.endTime).getTime() - Date.now();
-
-        // Cut-loss: market sell remaining
-        if (msLeft <= makerCutLossTime * 1000) {
-            logger.warn(`MAKER${tag}: sell phase cut-loss (${Math.round(msLeft / 1000)}s left)`);
-            await cutLossSells(pos, side, sideName, tag, sim);
-            break;
-        }
 
         // Check all sell orders concurrently
         const checks = await Promise.all(
@@ -380,37 +347,13 @@ async function monitorSellPhase(pos, tag, sim) {
             break;
         }
 
-        // Market expired
+        // Market expired — position resolves on-chain (no cut-loss)
         if (msLeft <= 0) {
-            pos.status = 'expired';
-            logger.warn(`MAKER${tag}: market expired`);
+            pos.status = 'expired-holding';
+            logger.info(`MAKER${tag}: market expired — holding position to resolution (no cut-loss)`);
             break;
         }
 
         await sleep(makerMonitorMs);
     }
-}
-
-async function cutLossSells(pos, side, sideName, tag, sim) {
-    const { makerSellPrice } = config;
-
-    // Cancel unfilled sell orders and market sell
-    let remainingShares = 0;
-    for (const so of side.sellOrders) {
-        if (!so.filled) {
-            await cancelOrder(so.orderId);
-            remainingShares += so.shares;
-        }
-    }
-
-    if (remainingShares > 0) {
-        logger.warn(`MAKER${tag}: ${sim}market-selling ${remainingShares.toFixed(2)} ${sideName} shares`);
-        const result = await marketSell(side.tokenId, remainingShares, pos.tickSize, pos.negRisk);
-        if (result.success) {
-            pos.totalRevenue += remainingShares * result.fillPrice;
-            logger.warn(`MAKER${tag}: ${sim}${sideName} CL sold @ $${result.fillPrice.toFixed(3)}`);
-        }
-    }
-
-    pos.status = 'done';
 }

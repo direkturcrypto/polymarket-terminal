@@ -107,7 +107,7 @@ async function runStrategy(market) {
         pendingByAsset.delete(market.asset);
         const secsLeft = Math.round((new Date(queued.endTime).getTime() - Date.now()) / 1000);
 
-        if (secsLeft > config.makerCutLossTime) {
+        if (secsLeft > 30) {
             logger.success(`MAKER[${market.asset?.toUpperCase()}]: executing queued market (${secsLeft}s left)`);
             runStrategy(queued);
         } else {
@@ -160,7 +160,7 @@ logger.info(`Sell @    : $${config.makerSellPrice} per share`);
 logger.info(`Size      : ${config.makerTradeSize} shares/side`);
 logger.info(`Cost/side : $${costPerSide.toFixed(2)}`);
 logger.info(`Profit    : $${profitPerCycle.toFixed(2)} per cycle`);
-logger.info(`Cut loss  : ${config.makerCutLossTime}s before close`);
+logger.info(`Cut loss  : NONE (hold to resolution)`);
 logger.info('==========================================');
 
 startMakerDetector(handleNewMarket);

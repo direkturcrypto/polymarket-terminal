@@ -112,7 +112,6 @@ const config = {
   makerBuyPrice: parseFloat(process.env.MAKER_BUY_PRICE || '0.02'),
   makerSellPrice: parseFloat(process.env.MAKER_SELL_PRICE || '0.03'),
   makerTradeSize: parseFloat(process.env.MAKER_TRADE_SIZE || '50'),    // shares per side
-  makerCutLossTime: parseInt(process.env.MAKER_CUT_LOSS_TIME || '60', 10),
   makerPollInterval: parseInt(process.env.MAKER_POLL_INTERVAL || '10', 10) * 1000,
   makerMonitorMs: parseInt(process.env.MAKER_MONITOR_MS || '2000', 10), // how fast to poll order status
 

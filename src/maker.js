@@ -78,7 +78,7 @@ async function buildStatusContent() {
     lines.push(`  Size     : ${config.makerTradeSize} shares/side`);
     lines.push(`  Cost/side: $${(config.makerTradeSize * config.makerBuyPrice).toFixed(2)}`);
     lines.push(`  Profit   : $${((config.makerSellPrice - config.makerBuyPrice) * config.makerTradeSize).toFixed(2)}/cycle`);
-    lines.push(`  Cut loss : ${config.makerCutLossTime}s before close`);
+    lines.push(`  No CL    : hold to resolution if sell unfilled`);
     lines.push('');
 
     // Active positions
@@ -204,7 +204,7 @@ async function runStrategy(market) {
         const endMs = new Date(queued.endTime).getTime();
         const secsLeft = Math.round((endMs - Date.now()) / 1000);
 
-        if (secsLeft > config.makerCutLossTime) {
+        if (secsLeft > 30) {
             logger.success(`MAKER[${market.asset?.toUpperCase()}]: executing queued market (${secsLeft}s left)`);
             runStrategy(queued);
         } else {
