@@ -21,7 +21,13 @@
     "sniper-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper.js",
     "sniper-tui": "DRY_RUN=false node src/sniper-tui.js",
     "sniper-tui-sim": "DRY_RUN=true node src/sniper-tui.js",
-    "sniper-tui-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper-tui.js"
+    "sniper-tui-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper-tui.js",
+    "maker": "DRY_RUN=false node src/maker.js",
+    "maker-sim": "DRY_RUN=true node src/maker.js",
+    "maker-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/maker.js",
+    "maker-bot": "node src/maker-bot.js",
+    "maker-bot-sim": "DRY_RUN=true node src/maker-bot.js",
+    "maker-bot-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/maker-bot.js"
   },
   "keywords": [
     "polymarket",

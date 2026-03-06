@@ -103,6 +103,19 @@ const config = {
     return schedule;
   })(),
 
+  // ── Market Maker v2 (Buy Low, Sell High) ──────────────────────
+  // Places limit BUY on UP+DOWN at low price, sells at higher price when filled.
+  // No splitPosition — pure orderbook strategy.
+  makerAssets: (process.env.MAKER_ASSETS || 'btc')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+  makerDuration: process.env.MAKER_DURATION || '5m',
+  makerBuyPrice: parseFloat(process.env.MAKER_BUY_PRICE || '0.02'),
+  makerSellPrice: parseFloat(process.env.MAKER_SELL_PRICE || '0.03'),
+  makerTradeSize: parseFloat(process.env.MAKER_TRADE_SIZE || '50'),    // shares per side
+  makerCutLossTime: parseInt(process.env.MAKER_CUT_LOSS_TIME || '60', 10),
+  makerPollInterval: parseInt(process.env.MAKER_POLL_INTERVAL || '10', 10) * 1000,
+  makerMonitorMs: parseInt(process.env.MAKER_MONITOR_MS || '2000', 10), // how fast to poll order status
+
   // ── Proxy (Polymarket API only, NOT Polygon RPC) ──────────────
   // Supports HTTP/HTTPS. Example: http://user:pass@host:port
   proxyUrl: process.env.PROXY_URL || '',
@@ -133,6 +146,21 @@ export function validateMMConfig() {
   if (config.mmTradeSize <= 0) throw new Error('MM_TRADE_SIZE must be > 0');
   if (config.mmSellPrice <= 0 || config.mmSellPrice >= 1)
     throw new Error('MM_SELL_PRICE must be between 0 and 1');
+}
+
+// Validation for maker bot (buy low, sell high)
+export function validateMakerConfig() {
+  const required = ['privateKey', 'proxyWallet'];
+  const missing = required.filter((key) => !config[key]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required config: ${missing.join(', ')}. Check your .env file.`);
+  }
+  if (config.makerBuyPrice <= 0 || config.makerBuyPrice >= 1)
+    throw new Error('MAKER_BUY_PRICE must be between 0 and 1');
+  if (config.makerSellPrice <= config.makerBuyPrice)
+    throw new Error('MAKER_SELL_PRICE must be greater than MAKER_BUY_PRICE');
+  if (config.makerTradeSize <= 0)
+    throw new Error('MAKER_TRADE_SIZE must be > 0');
 }
 
 export default config;
