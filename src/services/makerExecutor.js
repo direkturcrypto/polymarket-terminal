@@ -1,31 +1,88 @@
 /**
  * makerExecutor.js
- * Buy Low, Sell High Market Maker — no splitPosition, no cut-loss.
+ * Buy Low, Sell High Market Maker — no splitPosition.
  *
  * Flow:
- *   1. Place concurrent limit BUY on UP + DOWN at makerBuyPrice (e.g. 2c)
- *   2. Monitor both orders in parallel (multi-thread style)
- *   3. When one side fills (even partial):
- *      a. Immediately place limit SELL for filled shares at makerSellPrice (e.g. 3c)
- *      b. Cancel the other side's buy order
- *   4. Partial fills → partial sells placed immediately
- *   5. Monitor sell orders until filled or market expires
- *   6. No cut-loss — worst case is losing buy cost (2c/share) on wrong side,
- *      or gaining $1/share if on winning side and sell doesn't fill
+ *   1. Ensure ERC1155 exchange approval (one-time, needed to sell tokens)
+ *   2. Place concurrent limit BUY on UP + DOWN at makerBuyPrice (e.g. 2c)
+ *   3. Monitor both orders in parallel (multi-thread style)
+ *   4. When one side fills (even partial):
+ *      a. Wait briefly for on-chain settlement
+ *      b. Place limit SELL for filled shares at makerSellPrice (e.g. 3c)
+ *      c. Cancel the other side's buy order
+ *   5. Partial fills → partial sells placed immediately
+ *   6. Monitor sell orders until filled or 10s before market close
+ *   7. CL at 10s: cancel unfilled sell orders (tokens resolve on-chain)
  */
 
 import { Side, OrderType } from '@polymarket/clob-client';
 import config from '../config/index.js';
 import { getClient } from './client.js';
+import { ensureExchangeApproval } from './ctf.js';
 import logger from '../utils/logger.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const CL_SECONDS = 10; // cancel unfilled sells 10s before market close
+const SELL_DELAY_MS = 2000; // wait for on-chain settlement before placing sell
+const MAX_SELL_RETRIES = 3;
 
 // In-memory store of active maker positions
 const activePositions = new Map();
 
 export function getActiveMakerPositions() {
     return Array.from(activePositions.values());
+}
+
+// ── Simulation stats ─────────────────────────────────────────────────────────
+
+const simStats = {
+    startBalance: config.makerSimBalance,
+    balance: config.makerSimBalance,
+    wins: 0,        // sell filled → realized profit
+    losses: 0,      // buy filled, sell NOT filled → loss = buy cost
+    skips: 0,       // no fills at all → $0
+    totalTrades: 0,
+    cumulativePnl: 0,
+    history: [],    // [{ time, side, result, pnl, balance }]
+};
+
+export function getSimStats() {
+    return { ...simStats, history: [...simStats.history] };
+}
+
+function recordTrade(result, side, pnl) {
+    simStats.totalTrades++;
+    simStats.cumulativePnl += pnl;
+    simStats.balance += pnl;
+
+    if (result === 'win') simStats.wins++;
+    else if (result === 'loss') simStats.losses++;
+    else simStats.skips++;
+
+    simStats.history.push({
+        time: new Date().toISOString().replace('T', ' ').substring(11, 19),
+        side: side || '-',
+        result,
+        pnl,
+        balance: simStats.balance,
+    });
+
+    if (simStats.history.length > 50) simStats.history.splice(0, simStats.history.length - 50);
+}
+
+// ── Approval tracking ────────────────────────────────────────────────────────
+
+let approvalChecked = false;
+
+async function ensureApproval(negRisk) {
+    if (config.dryRun || approvalChecked) return;
+    try {
+        await ensureExchangeApproval(negRisk);
+        approvalChecked = true;
+    } catch (err) {
+        logger.error(`MAKER: exchange approval failed — ${err.message}`);
+    }
 }
 
 // ── Order helpers ─────────────────────────────────────────────────────────────
@@ -49,23 +106,39 @@ async function placeLimitBuy(tokenId, shares, price, tickSize, negRisk) {
     }
 }
 
-async function placeLimitSell(tokenId, shares, price, tickSize, negRisk) {
+async function placeLimitSellWithRetry(tokenId, shares, price, tickSize, negRisk, tag) {
     if (config.dryRun) {
         return { success: true, orderId: `sim-sell-${Date.now()}-${tokenId.slice(-6)}` };
     }
+
     const client = getClient();
-    try {
-        const res = await client.createAndPostOrder(
-            { tokenID: tokenId, side: Side.SELL, price, size: shares },
-            { tickSize, negRisk },
-            OrderType.GTC,
-        );
-        if (!res?.success) return { success: false };
-        return { success: true, orderId: res.orderID };
-    } catch (err) {
-        logger.error('MAKER limit sell error:', err.message);
-        return { success: false };
+
+    for (let attempt = 1; attempt <= MAX_SELL_RETRIES; attempt++) {
+        try {
+            const res = await client.createAndPostOrder(
+                { tokenID: tokenId, side: Side.SELL, price, size: shares },
+                { tickSize, negRisk },
+                OrderType.GTC,
+            );
+            if (res?.success) {
+                return { success: true, orderId: res.orderID };
+            }
+
+            const errMsg = res?.errorMsg || 'unknown';
+            logger.warn(`MAKER${tag}: sell attempt ${attempt}/${MAX_SELL_RETRIES} failed: ${errMsg}`);
+        } catch (err) {
+            logger.warn(`MAKER${tag}: sell attempt ${attempt}/${MAX_SELL_RETRIES} error: ${err.message}`);
+        }
+
+        if (attempt < MAX_SELL_RETRIES) {
+            // Wait longer each retry — tokens might not have settled yet
+            const delay = SELL_DELAY_MS * attempt;
+            logger.info(`MAKER${tag}: waiting ${delay / 1000}s for on-chain settlement before retry...`);
+            await sleep(delay);
+        }
     }
+
+    return { success: false };
 }
 
 async function cancelOrder(orderId) {
@@ -121,8 +194,19 @@ export async function executeMakerStrategy(market) {
     const sim = config.dryRun ? '[SIM] ' : '';
     const { makerBuyPrice, makerSellPrice, makerTradeSize, makerMonitorMs } = config;
 
+    // Check sim balance
+    const costPerSide = makerTradeSize * makerBuyPrice;
+    if (config.dryRun && simStats.balance < costPerSide) {
+        logger.warn(`MAKER${tag}: ${sim}insufficient sim balance $${simStats.balance.toFixed(2)} (need $${costPerSide.toFixed(2)}) — skipping`);
+        recordTrade('skip', null, 0);
+        return;
+    }
+
     logger.info(`MAKER${tag}: ${sim}entering — ${label}`);
-    logger.info(`MAKER${tag}: BUY @ $${makerBuyPrice} → SELL @ $${makerSellPrice} | ${makerTradeSize} shares/side`);
+    logger.info(`MAKER${tag}: BUY @ $${makerBuyPrice} → SELL @ $${makerSellPrice} | ${makerTradeSize} shares/side | cost $${costPerSide.toFixed(2)}`);
+
+    // ── 0. Ensure ERC1155 exchange approval (one-time) ───────────
+    await ensureApproval(negRisk);
 
     // ── 1. Place BUY UP + DOWN concurrently ──────────────────────
     logger.trade(`MAKER${tag}: ${sim}placing BUY UP + DOWN @ $${makerBuyPrice}`);
@@ -134,6 +218,7 @@ export async function executeMakerStrategy(market) {
 
     if (!upBuy.success && !downBuy.success) {
         logger.error(`MAKER${tag}: both buy orders failed — aborting`);
+        recordTrade('skip', null, 0);
         return;
     }
 
@@ -154,7 +239,7 @@ export async function executeMakerStrategy(market) {
             tokenId: yesTokenId,
             buyOrderId: upBuy.success ? upBuy.orderId : null,
             buyFilled: 0,
-            sellOrders: [],     // { orderId, shares, filled, fillPrice }
+            sellOrders: [],
             totalSellFilled: 0,
             cancelled: !upBuy.success,
         },
@@ -166,7 +251,7 @@ export async function executeMakerStrategy(market) {
             totalSellFilled: 0,
             cancelled: !downBuy.success,
         },
-        winner: null,           // 'up' or 'down'
+        winner: null,
         totalCost: 0,
         totalRevenue: 0,
     };
@@ -181,19 +266,28 @@ export async function executeMakerStrategy(market) {
         logger.error(`MAKER${tag}: strategy error — ${err.message}`);
     }
 
-    // ── Final P&L ────────────────────────────────────────────────
+    // ── Final result + sim stats ─────────────────────────────────
     const pnl = pos.totalRevenue - pos.totalCost;
-    const sign = pnl >= 0 ? '+' : '';
+    const winnerSide = pos.winner?.toUpperCase() || '-';
 
-    if (pos.status === 'expired-holding') {
-        // Position held to expiry — will resolve on-chain
-        const side = pos[pos.winner];
-        logger.info(`MAKER${tag}: ${sim}holding ${side.buyFilled.toFixed(2)} ${pos.winner.toUpperCase()} shares to resolution`);
-        logger.info(`MAKER${tag}: ${sim}if winning side → payout $${side.buyFilled.toFixed(2)} (cost $${pos.totalCost.toFixed(4)})`);
-        logger.info(`MAKER${tag}: ${sim}if losing side  → payout $0 (loss $${pos.totalCost.toFixed(4)})`);
+    if (pos.status === 'done' && pos.totalRevenue > 0) {
+        // WIN: sell filled
+        recordTrade('win', winnerSide, pnl);
+        logger.money(`MAKER${tag}: ${sim}WIN | ${winnerSide} | cost $${pos.totalCost.toFixed(4)} → revenue $${pos.totalRevenue.toFixed(4)} | P&L +$${pnl.toFixed(4)}`);
+    } else if (pos.totalCost > 0) {
+        // LOSS: buy filled but sell didn't fill (expired-holding)
+        recordTrade('loss', winnerSide, -pos.totalCost);
+        logger.warn(`MAKER${tag}: ${sim}LOSS | ${winnerSide} | cost $${pos.totalCost.toFixed(4)} (sell not filled, held to expiry)`);
     } else {
-        logger.money(`MAKER${tag}: ${sim}strategy complete | cost $${pos.totalCost.toFixed(4)} | revenue $${pos.totalRevenue.toFixed(4)} | P&L ${sign}$${pnl.toFixed(4)}`);
+        // SKIP: nothing filled
+        recordTrade('skip', null, 0);
+        logger.info(`MAKER${tag}: ${sim}SKIP | no fills, $0 cost`);
     }
+
+    // Log running stats
+    const s = simStats;
+    const winRate = s.wins + s.losses > 0 ? ((s.wins / (s.wins + s.losses)) * 100).toFixed(1) : '0.0';
+    logger.info(`MAKER${tag}: ${sim}STATS | W:${s.wins} L:${s.losses} S:${s.skips} | Win%: ${winRate}% | PnL: $${s.cumulativePnl.toFixed(4)} | Balance: $${s.balance.toFixed(2)}`);
 
     activePositions.delete(conditionId);
 }
@@ -203,18 +297,15 @@ export async function executeMakerStrategy(market) {
 async function monitorBuyPhase(pos, tag, sim) {
     const { makerBuyPrice, makerSellPrice, makerMonitorMs } = config;
 
-    // Run two concurrent monitors — first full fill wins
     const monitorSide = async (sideKey) => {
         const side = pos[sideKey];
         const otherKey = sideKey === 'up' ? 'down' : 'up';
         const sideName = sideKey.toUpperCase();
 
-        if (!side.buyOrderId) return; // order failed at placement
+        if (!side.buyOrderId) return;
 
         while (!pos.winner) {
             const msLeft = new Date(pos.endTime).getTime() - Date.now();
-
-            // Market expired — buy orders expire naturally
             if (msLeft <= 0) break;
 
             // Check fill
@@ -230,7 +321,7 @@ async function monitorBuyPhase(pos, tag, sim) {
                 fill = await getOrderFill(side.buyOrderId);
             }
 
-            // New fills detected → place sell immediately
+            // New fills detected → wait for settlement, then place sell
             const newFill = fill.matched - side.buyFilled;
             if (newFill > 0) {
                 side.buyFilled = fill.matched;
@@ -238,8 +329,16 @@ async function monitorBuyPhase(pos, tag, sim) {
 
                 logger.money(`MAKER${tag}: ${sim}${sideName} BUY filled ${newFill.toFixed(2)} shares @ $${makerBuyPrice} (total: ${side.buyFilled.toFixed(2)}/${config.makerTradeSize})`);
 
-                // Place sell immediately for the newly filled amount
-                const sellResult = await placeLimitSell(side.tokenId, newFill, makerSellPrice, pos.tickSize, pos.negRisk);
+                // Wait for on-chain token settlement before placing sell
+                if (!config.dryRun) {
+                    logger.info(`MAKER${tag}: waiting ${SELL_DELAY_MS / 1000}s for on-chain settlement...`);
+                    await sleep(SELL_DELAY_MS);
+                }
+
+                const sellResult = await placeLimitSellWithRetry(
+                    side.tokenId, newFill, makerSellPrice,
+                    pos.tickSize, pos.negRisk, tag,
+                );
                 if (sellResult.success) {
                     side.sellOrders.push({
                         orderId: sellResult.orderId,
@@ -248,16 +347,17 @@ async function monitorBuyPhase(pos, tag, sim) {
                         fillPrice: null,
                     });
                     logger.trade(`MAKER${tag}: ${sim}${sideName} SELL placed ${newFill.toFixed(2)} shares @ $${makerSellPrice}`);
+                } else {
+                    logger.error(`MAKER${tag}: ${sideName} SELL failed after ${MAX_SELL_RETRIES} retries — tokens held to resolution`);
                 }
             }
 
-            // Fully filled → we have a winner
+            // Fully filled → winner
             if (fill.fullyFilled) {
                 pos.winner = sideKey;
                 pos.status = 'selling';
                 logger.success(`MAKER${tag}: ${sim}${sideName} fully filled! Cancelling ${otherKey.toUpperCase()} buy...`);
 
-                // Cancel the other side's buy
                 const other = pos[otherKey];
                 if (other.buyOrderId && !other.cancelled) {
                     await cancelOrder(other.buyOrderId);
@@ -271,15 +371,12 @@ async function monitorBuyPhase(pos, tag, sim) {
         }
     };
 
-    // Run both side monitors concurrently — race to first full fill
     await Promise.race([
         monitorSide('up'),
         monitorSide('down'),
     ]);
 
-    // If no winner (market expired without fills)
     if (!pos.winner) {
-        // Check if any partial fills exist
         const anyFill = pos.up.buyFilled > 0 || pos.down.buyFilled > 0;
         if (anyFill) {
             pos.winner = pos.up.buyFilled >= pos.down.buyFilled ? 'up' : 'down';
@@ -292,7 +389,7 @@ async function monitorBuyPhase(pos, tag, sim) {
     }
 }
 
-// ── Sell phase: monitor sell orders until filled or market expires ────────────
+// ── Sell phase: monitor sell orders, CL at 10s before close ──────────────────
 
 async function monitorSellPhase(pos, tag, sim) {
     if (pos.status === 'done') return;
@@ -304,10 +401,33 @@ async function monitorSellPhase(pos, tag, sim) {
     const side = pos[winnerKey];
     const sideName = winnerKey.toUpperCase();
 
+    if (side.sellOrders.length === 0) {
+        // Sell placement failed — tokens held to resolution
+        pos.status = 'expired-holding';
+        logger.warn(`MAKER${tag}: no sell orders placed — held to resolution`);
+        return;
+    }
+
     logger.info(`MAKER${tag}: monitoring ${side.sellOrders.length} sell order(s) for ${sideName}`);
 
     while (true) {
         const msLeft = new Date(pos.endTime).getTime() - Date.now();
+
+        // ── CL at 10s: cancel unfilled sells, let tokens resolve on-chain ──
+        if (msLeft <= CL_SECONDS * 1000) {
+            let unfilledCount = 0;
+            for (const so of side.sellOrders) {
+                if (!so.filled) {
+                    await cancelOrder(so.orderId);
+                    unfilledCount++;
+                }
+            }
+            if (unfilledCount > 0) {
+                logger.warn(`MAKER${tag}: CL ${CL_SECONDS}s — cancelled ${unfilledCount} unfilled sell order(s), held to resolution`);
+            }
+            pos.status = side.totalSellFilled > 0 ? 'done' : 'expired-holding';
+            break;
+        }
 
         // Check all sell orders concurrently
         const checks = await Promise.all(
@@ -344,13 +464,6 @@ async function monitorSellPhase(pos, tag, sim) {
         if (checks.every(Boolean) && side.sellOrders.length > 0) {
             pos.status = 'done';
             logger.success(`MAKER${tag}: ${sim}all sells filled!`);
-            break;
-        }
-
-        // Market expired — position resolves on-chain (no cut-loss)
-        if (msLeft <= 0) {
-            pos.status = 'expired-holding';
-            logger.info(`MAKER${tag}: market expired — holding position to resolution (no cut-loss)`);
             break;
         }
 

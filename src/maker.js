@@ -17,7 +17,7 @@ import logger from './utils/logger.js';
 import { initClient, getUsdcBalance } from './services/client.js';
 import { initDashboard, appendLog, updateStatus, isDashboardActive } from './ui/dashboard.js';
 import { startMakerDetector, stopMakerDetector } from './services/makerDetector.js';
-import { executeMakerStrategy, getActiveMakerPositions } from './services/makerExecutor.js';
+import { executeMakerStrategy, getActiveMakerPositions, getSimStats } from './services/makerExecutor.js';
 import { OrderbookWs } from './services/makerWs.js';
 
 // ── Validate config ────────────────────────────────────────────────────────────
@@ -53,21 +53,42 @@ let activeWsTokens = { up: null, down: null };
 async function buildStatusContent() {
     const lines = [];
 
-    // Balance
-    let balance = '?';
-    if (!config.dryRun) {
-        try { balance = (await getUsdcBalance()).toFixed(2); } catch { /* ignore */ }
-    } else {
-        balance = '{yellow-fg}SIM{/yellow-fg}';
-    }
-    lines.push('{bold}BALANCE{/bold}');
-    lines.push(`  USDC.e: {green-fg}$${balance}{/green-fg}`);
-    lines.push('');
+    // Balance + Sim Stats
+    if (config.dryRun) {
+        const s = getSimStats();
+        const pnlColor = s.cumulativePnl >= 0 ? 'green' : 'red';
+        const winRate = s.wins + s.losses > 0 ? ((s.wins / (s.wins + s.losses)) * 100).toFixed(1) : '0.0';
+        const pnlSign = s.cumulativePnl >= 0 ? '+' : '';
 
-    // Mode
-    lines.push('{bold}MODE{/bold}');
-    lines.push(`  ${config.dryRun ? '{yellow-fg}SIMULATION{/yellow-fg}' : '{green-fg}LIVE{/green-fg}'}`);
-    lines.push('');
+        lines.push('{bold}SIMULATION{/bold}');
+        lines.push(`  Balance : {green-fg}$${s.balance.toFixed(2)}{/green-fg} (start: $${s.startBalance.toFixed(2)})`);
+        lines.push(`  PnL     : {${pnlColor}-fg}${pnlSign}$${s.cumulativePnl.toFixed(4)}{/${pnlColor}-fg}`);
+        lines.push(`  Trades  : ${s.totalTrades} total`);
+        lines.push(`  {green-fg}WIN  ${s.wins}x{/green-fg} | {red-fg}LOSS ${s.losses}x{/red-fg} | {gray-fg}SKIP ${s.skips}x{/gray-fg}`);
+        lines.push(`  Win%    : ${winRate}%`);
+        lines.push('');
+
+        // Recent trade history
+        if (s.history.length > 0) {
+            lines.push('{bold}TRADE HISTORY{/bold}');
+            const recent = s.history.slice(-8);
+            for (const h of recent) {
+                const rColor = h.result === 'win' ? 'green' : h.result === 'loss' ? 'red' : 'gray';
+                const pSign = h.pnl >= 0 ? '+' : '';
+                lines.push(`  {gray-fg}${h.time}{/gray-fg} {${rColor}-fg}${h.result.toUpperCase().padEnd(4)}{/${rColor}-fg} ${(h.side || '-').padEnd(4)} {${rColor}-fg}${pSign}$${h.pnl.toFixed(4)}{/${rColor}-fg} → $${h.balance.toFixed(2)}`);
+            }
+            lines.push('');
+        }
+    } else {
+        let balance = '?';
+        try { balance = (await getUsdcBalance()).toFixed(2); } catch { /* ignore */ }
+        lines.push('{bold}BALANCE{/bold}');
+        lines.push(`  USDC.e: {green-fg}$${balance}{/green-fg}`);
+        lines.push('');
+        lines.push('{bold}MODE{/bold}');
+        lines.push('  {green-fg}LIVE{/green-fg}');
+        lines.push('');
+    }
 
     // Maker Config
     lines.push('{bold}MAKER CONFIG{/bold}');

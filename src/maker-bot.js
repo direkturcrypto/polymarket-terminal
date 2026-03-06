@@ -13,7 +13,7 @@ import config from './config/index.js';
 import logger from './utils/logger.js';
 import { initClient, getUsdcBalance } from './services/client.js';
 import { startMakerDetector, stopMakerDetector } from './services/makerDetector.js';
-import { executeMakerStrategy, getActiveMakerPositions } from './services/makerExecutor.js';
+import { executeMakerStrategy, getActiveMakerPositions, getSimStats } from './services/makerExecutor.js';
 import { OrderbookWs } from './services/makerWs.js';
 
 logger.interceptConsole();
@@ -52,7 +52,14 @@ async function printStatus() {
         const positions = getActiveMakerPositions();
         const mode = config.dryRun ? 'SIMULATION' : 'LIVE';
 
-        logger.info(`--- MAKER Status [${mode}] | Balance: ${balanceStr} | Active: ${positions.length} ---`);
+        if (config.dryRun) {
+            const s = getSimStats();
+            const winRate = s.wins + s.losses > 0 ? ((s.wins / (s.wins + s.losses)) * 100).toFixed(1) : '0.0';
+            const pnlSign = s.cumulativePnl >= 0 ? '+' : '';
+            logger.info(`--- MAKER [SIM] | $${s.balance.toFixed(2)} (${pnlSign}$${s.cumulativePnl.toFixed(4)}) | W:${s.wins} L:${s.losses} S:${s.skips} Win%:${winRate}% | Active: ${positions.length} ---`);
+        } else {
+            logger.info(`--- MAKER Status [${mode}] | Balance: ${balanceStr} | Active: ${positions.length} ---`);
+        }
 
         for (const pos of positions) {
             const assetTag = pos.asset ? `[${pos.asset.toUpperCase()}] ` : '';
