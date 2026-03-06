@@ -27,6 +27,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CL_SECONDS = 10; // cancel unfilled sells 10s before market close
 const SELL_DELAY_MS = 2000; // wait for on-chain settlement before placing sell
 const MAX_SELL_RETRIES = 3;
+const MIN_ORDER_SIZE = 5; // Polymarket minimum order size
 
 // In-memory store of active maker positions
 const activePositions = new Map();
@@ -89,18 +90,19 @@ async function ensureApproval(negRisk) {
 // ── Order helpers ─────────────────────────────────────────────────────────────
 
 async function placeLimitBuy(tokenId, shares, price, tickSize, negRisk) {
+    const size = Math.max(MIN_ORDER_SIZE, Math.floor(shares));
     if (config.dryRun) {
-        return { success: true, orderId: `sim-buy-${Date.now()}-${tokenId.slice(-6)}` };
+        return { success: true, orderId: `sim-buy-${Date.now()}-${tokenId.slice(-6)}`, size };
     }
     const client = getClient();
     try {
         const res = await client.createAndPostOrder(
-            { tokenID: tokenId, side: Side.BUY, price, size: shares },
+            { tokenID: tokenId, side: Side.BUY, price, size },
             { tickSize, negRisk },
             OrderType.GTC,
         );
         if (!res?.success) return { success: false };
-        return { success: true, orderId: res.orderID };
+        return { success: true, orderId: res.orderID, size };
     } catch (err) {
         logger.error('MAKER limit buy error:', err.message);
         return { success: false };
@@ -108,6 +110,7 @@ async function placeLimitBuy(tokenId, shares, price, tickSize, negRisk) {
 }
 
 async function placeLimitSellWithRetry(tokenId, shares, price, tickSize, negRisk, tag) {
+    const size = Math.max(MIN_ORDER_SIZE, Math.floor(shares));
     if (config.dryRun) {
         return { success: true, orderId: `sim-sell-${Date.now()}-${tokenId.slice(-6)}` };
     }
@@ -117,7 +120,7 @@ async function placeLimitSellWithRetry(tokenId, shares, price, tickSize, negRisk
     for (let attempt = 1; attempt <= MAX_SELL_RETRIES; attempt++) {
         try {
             const res = await client.createAndPostOrder(
-                { tokenID: tokenId, side: Side.SELL, price, size: shares },
+                { tokenID: tokenId, side: Side.SELL, price, size },
                 { tickSize, negRisk },
                 OrderType.GTC,
             );
@@ -339,26 +342,34 @@ async function monitorBuyPhase(pos, tag, sim) {
 
                 logger.money(`MAKER${tag}: ${sim}${sideName} BUY filled ${newFill.toFixed(2)} shares @ $${makerBuyPrice} (total: ${side.buyFilled.toFixed(2)}/${config.makerTradeSize})`);
 
-                // Wait for on-chain token settlement before placing sell
-                if (!config.dryRun) {
-                    logger.info(`MAKER${tag}: waiting ${SELL_DELAY_MS / 1000}s for on-chain settlement...`);
-                    await sleep(SELL_DELAY_MS);
-                }
+                // Check total unsold shares — only place sell if >= MIN_ORDER_SIZE
+                const soldShares = side.sellOrders.reduce((sum, so) => sum + so.shares, 0);
+                const unsold = side.buyFilled - soldShares;
 
-                const sellResult = await placeLimitSellWithRetry(
-                    side.tokenId, newFill, makerSellPrice,
-                    pos.tickSize, pos.negRisk, tag,
-                );
-                if (sellResult.success) {
-                    side.sellOrders.push({
-                        orderId: sellResult.orderId,
-                        shares: newFill,
-                        filled: false,
-                        fillPrice: null,
-                    });
-                    logger.trade(`MAKER${tag}: ${sim}${sideName} SELL placed ${newFill.toFixed(2)} shares @ $${makerSellPrice}`);
+                if (unsold >= MIN_ORDER_SIZE) {
+                    // Wait for on-chain token settlement before placing sell
+                    if (!config.dryRun) {
+                        logger.info(`MAKER${tag}: waiting ${SELL_DELAY_MS / 1000}s for on-chain settlement...`);
+                        await sleep(SELL_DELAY_MS);
+                    }
+
+                    const sellResult = await placeLimitSellWithRetry(
+                        side.tokenId, unsold, makerSellPrice,
+                        pos.tickSize, pos.negRisk, tag,
+                    );
+                    if (sellResult.success) {
+                        side.sellOrders.push({
+                            orderId: sellResult.orderId,
+                            shares: unsold,
+                            filled: false,
+                            fillPrice: null,
+                        });
+                        logger.trade(`MAKER${tag}: ${sim}${sideName} SELL placed ${unsold.toFixed(2)} shares @ $${makerSellPrice}`);
+                    } else {
+                        logger.error(`MAKER${tag}: ${sideName} SELL failed after ${MAX_SELL_RETRIES} retries — tokens held to resolution`);
+                    }
                 } else {
-                    logger.error(`MAKER${tag}: ${sideName} SELL failed after ${MAX_SELL_RETRIES} retries — tokens held to resolution`);
+                    logger.info(`MAKER${tag}: ${sideName} unsold ${unsold.toFixed(2)} shares < ${MIN_ORDER_SIZE} min — waiting for more fills`);
                 }
             }
 
@@ -401,7 +412,7 @@ async function monitorBuyPhase(pos, tag, sim) {
         const s = pos[key];
         const soldShares = s.sellOrders.reduce((sum, so) => sum + so.shares, 0);
         const unsold = s.buyFilled - soldShares;
-        if (unsold > 0) {
+        if (unsold >= MIN_ORDER_SIZE) {
             logger.info(`MAKER${tag}: placing sell for ${key.toUpperCase()} ${unsold.toFixed(2)} unsold shares`);
             if (!config.dryRun) {
                 logger.info(`MAKER${tag}: waiting ${SELL_DELAY_MS / 1000}s for on-chain settlement...`);

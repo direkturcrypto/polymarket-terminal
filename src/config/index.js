@@ -160,8 +160,8 @@ export function validateMakerConfig() {
     throw new Error('MAKER_BUY_PRICE must be between 0 and 1');
   if (config.makerSellPrice <= config.makerBuyPrice)
     throw new Error('MAKER_SELL_PRICE must be greater than MAKER_BUY_PRICE');
-  if (config.makerTradeSize <= 0)
-    throw new Error('MAKER_TRADE_SIZE must be > 0');
+  if (config.makerTradeSize < 5)
+    throw new Error('MAKER_TRADE_SIZE must be >= 5 (Polymarket minimum order size)');
 }
 
 export default config;
