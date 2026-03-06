@@ -70,18 +70,15 @@ async function printStatus() {
                 ` | P&L: ${sign}$${pnl.toFixed(4)}`,
             );
 
-            // Orderbook snapshot in sim mode
-            if (config.dryRun) {
-                for (const [label, tokenId] of [['UP', pos.up.tokenId], ['DOWN', pos.down.tokenId]]) {
+            // Orderbook snapshot
+            for (const [label, tokenId] of [['UP', pos.up.tokenId], ['DOWN', pos.down.tokenId]]) {
+                const bestBid = orderbookWs.getBestBid(tokenId);
+                const bestAsk = orderbookWs.getBestAsk(tokenId);
+                if (bestBid || bestAsk) {
                     const book = orderbookWs.getBook(tokenId);
-                    const bestBid = book.bids[0];
-                    const bestAsk = book.asks[0];
-                    if (bestBid || bestAsk) {
-                        logger.info(
-                            `    ${label} book: bid $${bestBid?.price.toFixed(3) || '-'} × ${bestBid?.size.toFixed(0) || '-'}` +
-                            ` | ask $${bestAsk?.price.toFixed(3) || '-'} × ${bestAsk?.size.toFixed(0) || '-'}`,
-                        );
-                    }
+                    const bidDepth = book.bids.slice(0, 3).map(b => `${b.price.toFixed(2)}×${b.size.toFixed(0)}`).join(' ');
+                    const askDepth = book.asks.slice(0, 3).map(a => `${a.price.toFixed(2)}×${a.size.toFixed(0)}`).join(' ');
+                    logger.info(`    ${label}: [${bidDepth}] | [${askDepth}]`);
                 }
             }
         }

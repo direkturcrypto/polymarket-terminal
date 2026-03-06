@@ -126,44 +126,37 @@ async function buildStatusContent() {
         }
     }
 
-    // Orderbook display (simulation mode)
-    if (config.dryRun && activeWsTokens.up) {
+    // Orderbook display (always show when tokens are active)
+    if (activeWsTokens.up) {
         lines.push('{bold}LIVE ORDERBOOK{/bold}');
 
         for (const [label, tokenId] of [['UP', activeWsTokens.up], ['DOWN', activeWsTokens.down]]) {
             if (!tokenId) continue;
             const book = orderbookWs.getBook(tokenId);
-            const lastPrice = orderbookWs.getLastPrice(tokenId);
+            const bestBid = orderbookWs.getBestBid(tokenId);
+            const bestAsk = orderbookWs.getBestAsk(tokenId);
+            const mid = bestBid && bestAsk ? ((bestBid + bestAsk) / 2) : 0;
 
-            lines.push(`  {cyan-fg}${label}{/cyan-fg} (last: $${lastPrice.toFixed(3)})`);
+            lines.push(`  {cyan-fg}${label}{/cyan-fg} mid: $${mid.toFixed(3)} | bid: $${bestBid.toFixed(2)} ask: $${bestAsk.toFixed(2)}`);
 
-            // Top 3 asks (reversed so lowest is closest to spread)
-            const topAsks = book.asks.slice(0, 3).reverse();
+            // Top 5 asks (reversed so lowest is closest to spread)
+            const topAsks = book.asks.slice(0, 5).reverse();
             for (const ask of topAsks) {
-                lines.push(`    {red-fg}ASK $${ask.price.toFixed(3)} × ${ask.size.toFixed(0)}{/red-fg}`);
+                const bar = '█'.repeat(Math.min(10, Math.round(ask.size / 100)));
+                lines.push(`    {red-fg}$${ask.price.toFixed(2)} ${ask.size.toFixed(0).padStart(7)} ${bar}{/red-fg}`);
             }
 
-            // Spread
-            const bestBid = book.bids[0]?.price || 0;
-            const bestAsk = book.asks[0]?.price || 0;
+            // Spread line
             if (bestBid && bestAsk) {
-                lines.push(`    {gray-fg}--- spread: $${(bestAsk - bestBid).toFixed(3)} ---{/gray-fg}`);
+                const spread = bestAsk - bestBid;
+                lines.push(`    {yellow-fg}── spread $${spread.toFixed(2)} ──{/yellow-fg}`);
             }
 
-            // Top 3 bids
-            const topBids = book.bids.slice(0, 3);
+            // Top 5 bids
+            const topBids = book.bids.slice(0, 5);
             for (const bid of topBids) {
-                lines.push(`    {green-fg}BID $${bid.price.toFixed(3)} × ${bid.size.toFixed(0)}{/green-fg}`);
-            }
-
-            // Recent trades
-            const trades = orderbookWs.getRecentTrades(tokenId, 3);
-            if (trades.length > 0) {
-                lines.push(`    Trades:`);
-                for (const t of trades.reverse()) {
-                    const color = t.side === 'BUY' ? 'green' : 'red';
-                    lines.push(`      {${color}-fg}${t.side} $${t.price.toFixed(3)} × ${t.size.toFixed(0)}{/${color}-fg}`);
-                }
+                const bar = '█'.repeat(Math.min(10, Math.round(bid.size / 100)));
+                lines.push(`    {green-fg}$${bid.price.toFixed(2)} ${bid.size.toFixed(0).padStart(7)} ${bar}{/green-fg}`);
             }
             lines.push('');
         }

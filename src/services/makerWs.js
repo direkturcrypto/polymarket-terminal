@@ -3,17 +3,17 @@
  * WebSocket client for Polymarket CLOB orderbook + trade data.
  * Used by the simulation to display real-time orderbook and simulate fills.
  *
- * Endpoints:
- *   - Book updates (bids/asks)
- *   - Last trade price
- *   - Trade history
+ * Message formats from CLOB WS:
+ *   1. Book snapshot (initial): [{asset_id, bids, asks, timestamp, hash}] (array, no event_type)
+ *   2. price_change: {event_type:"price_change", price_changes:[{asset_id, price, size, side, best_bid, best_ask}]}
+ *   3. last_trade_price: {event_type:"last_trade_price", asset_id, price}
  */
 
 import WebSocket from 'ws';
 import logger from '../utils/logger.js';
 
 const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
-const PING_INTERVAL = 10_000;
+const PING_INTERVAL = 30_000;
 const RECONNECT_DELAY = 3000;
 const MAX_RECONNECT_DELAY = 30_000;
 
@@ -29,8 +29,13 @@ export class OrderbookWs {
         this.assetIds = [];
         this.conditionId = null;
 
-        // Orderbook state per asset
-        this.books = new Map(); // assetId → { bids: [], asks: [] }
+        // Orderbook state per asset: Map<price, size>
+        this.bids = new Map(); // assetId → Map<price, size>
+        this.asks = new Map(); // assetId → Map<price, size>
+
+        // Best bid/ask per asset (from price_change events)
+        this.bestBid = new Map(); // assetId → number
+        this.bestAsk = new Map(); // assetId → number
 
         // Recent trades per asset
         this.trades = new Map(); // assetId → [{ price, side, size, timestamp }]
@@ -39,17 +44,24 @@ export class OrderbookWs {
         this.lastPrice = new Map(); // assetId → number
 
         // Callbacks
-        this.onBookUpdate = null;    // (assetId, book) => void
-        this.onTradeUpdate = null;   // (assetId, trade) => void
-        this.onPriceUpdate = null;   // (assetId, price) => void
+        this.onBookUpdate = null;
+        this.onTradeUpdate = null;
+        this.onPriceUpdate = null;
     }
 
     subscribe(conditionId, assetIds) {
+        // Shutdown existing connection if any
+        if (this.ws) {
+            this.cleanup(false);
+        }
+
         this.conditionId = conditionId;
         this.assetIds = assetIds;
+        this.isShutdown = false;
 
         for (const id of assetIds) {
-            this.books.set(id, { bids: [], asks: [] });
+            this.bids.set(id, new Map());
+            this.asks.set(id, new Map());
             this.trades.set(id, []);
         }
 
@@ -65,16 +77,15 @@ export class OrderbookWs {
             logger.info('MAKER WS: connected to orderbook feed');
             this.reconnectDelay = RECONNECT_DELAY;
 
-            // Subscribe to book + trades for all assets
-            for (const assetId of this.assetIds) {
-                this.ws.send(JSON.stringify({
-                    auth: {},
-                    type: 'subscribe',
-                    markets: [this.conditionId],
-                    assets_ids: [assetId],
-                    channels: ['book', 'trades'],
-                }));
-            }
+            // Subscribe to all assets in one message
+            const msg = {
+                auth: {},
+                type: 'subscribe',
+                markets: [],
+                assets_ids: this.assetIds,
+                channels: ['book'],
+            };
+            this.ws.send(JSON.stringify(msg));
 
             this.startPing();
         });
@@ -87,7 +98,8 @@ export class OrderbookWs {
             this.ws?.pong();
         });
 
-        this.ws.on('close', () => {
+        this.ws.on('close', (code, reason) => {
+            logger.warn(`MAKER WS: disconnected (${code})`);
             this.cleanup(true);
         });
 
@@ -102,61 +114,118 @@ export class OrderbookWs {
         try {
             msg = JSON.parse(raw.toString());
         } catch {
-            const text = raw.toString().trim();
-            if (text === 'ping') this.ws?.send('pong');
             return;
         }
 
-        if (msg.type === 'ping' || msg === 'ping') {
-            this.ws?.send('pong');
+        // Initial book snapshot comes as an array [{...}]
+        if (Array.isArray(msg)) {
+            for (const evt of msg) {
+                if (evt.asset_id && evt.bids) {
+                    this.handleBookSnapshot(evt.asset_id, evt);
+                }
+            }
             return;
         }
 
-        // Handle different event types from the CLOB WS
-        const events = Array.isArray(msg) ? msg : [msg];
+        // Subsequent messages are objects with event_type
+        switch (msg.event_type) {
+            case 'book':
+                if (msg.asset_id) {
+                    this.handleBookSnapshot(msg.asset_id, msg);
+                }
+                break;
 
-        for (const evt of events) {
-            const assetId = evt.asset_id;
+            case 'price_change':
+                this.handlePriceChange(msg);
+                break;
+
+            case 'last_trade_price':
+                if (msg.asset_id) {
+                    this.handleLastPrice(msg.asset_id, msg);
+                }
+                break;
+
+            default:
+                // Full book updates without event_type (non-array single object)
+                if (msg.asset_id && msg.bids) {
+                    this.handleBookSnapshot(msg.asset_id, msg);
+                }
+                break;
+        }
+    }
+
+    handleBookSnapshot(assetId, evt) {
+        if (!this.assetIds.includes(assetId)) return;
+
+        // Replace entire book for this asset
+        const bidMap = new Map();
+        for (const b of (evt.bids || [])) {
+            const price = parseFloat(b.price);
+            const size = parseFloat(b.size);
+            if (size > 0) bidMap.set(price, size);
+        }
+        this.bids.set(assetId, bidMap);
+
+        const askMap = new Map();
+        for (const a of (evt.asks || [])) {
+            const price = parseFloat(a.price);
+            const size = parseFloat(a.size);
+            if (size > 0) askMap.set(price, size);
+        }
+        this.asks.set(assetId, askMap);
+
+        if (this.onBookUpdate) {
+            this.onBookUpdate(assetId, this.getBook(assetId));
+        }
+    }
+
+    handlePriceChange(msg) {
+        const changes = msg.price_changes || [];
+
+        for (const change of changes) {
+            const assetId = change.asset_id;
             if (!assetId || !this.assetIds.includes(assetId)) continue;
 
-            switch (evt.event_type) {
-                case 'book':
-                    this.handleBook(assetId, evt);
-                    break;
-                case 'last_trade_price':
-                    this.handleLastPrice(assetId, evt);
-                    break;
-                case 'tick_size_change':
-                    break; // ignore
-                default:
-                    // Could be trade data
-                    if (evt.price && evt.side) {
-                        this.handleTrade(assetId, evt);
+            const price = parseFloat(change.price);
+            const size = parseFloat(change.size);
+            const side = change.side; // "BUY" = bid, "SELL" = ask
+
+            if (side === 'BUY') {
+                const bidMap = this.bids.get(assetId);
+                if (bidMap) {
+                    if (size > 0) {
+                        bidMap.set(price, size);
+                    } else {
+                        bidMap.delete(price); // size 0 = remove level
                     }
-                    break;
+                }
+            } else if (side === 'SELL') {
+                const askMap = this.asks.get(assetId);
+                if (askMap) {
+                    if (size > 0) {
+                        askMap.set(price, size);
+                    } else {
+                        askMap.delete(price);
+                    }
+                }
+            }
+
+            // Update best bid/ask from the event
+            if (change.best_bid) this.bestBid.set(assetId, parseFloat(change.best_bid));
+            if (change.best_ask) this.bestAsk.set(assetId, parseFloat(change.best_ask));
+        }
+
+        // Notify for each affected asset
+        const affectedAssets = new Set(changes.map(c => c.asset_id).filter(id => this.assetIds.includes(id)));
+        for (const assetId of affectedAssets) {
+            if (this.onBookUpdate) {
+                this.onBookUpdate(assetId, this.getBook(assetId));
             }
         }
     }
 
-    handleBook(assetId, evt) {
-        const bids = (evt.bids || []).map((b) => ({
-            price: parseFloat(b.price),
-            size: parseFloat(b.size),
-        })).sort((a, b) => b.price - a.price);
-
-        const asks = (evt.asks || []).map((a) => ({
-            price: parseFloat(a.price),
-            size: parseFloat(a.size),
-        })).sort((a, b) => a.price - b.price);
-
-        this.books.set(assetId, { bids, asks, timestamp: evt.timestamp });
-
-        if (this.onBookUpdate) {
-            this.onBookUpdate(assetId, { bids, asks });
-        }
-    }
-
     handleLastPrice(assetId, evt) {
+        if (!this.assetIds.includes(assetId)) return;
         const price = parseFloat(evt.price || '0');
         this.lastPrice.set(assetId, price);
 
@@ -165,38 +234,31 @@ export class OrderbookWs {
         }
     }
 
-    handleTrade(assetId, evt) {
-        const trade = {
-            price: parseFloat(evt.price || '0'),
-            side: evt.side || '',
-            size: parseFloat(evt.size || evt.amount || '0'),
-            timestamp: evt.timestamp || new Date().toISOString(),
-        };
+    /**
+     * Get sorted orderbook for an asset
+     */
+    getBook(assetId) {
+        const bidMap = this.bids.get(assetId) || new Map();
+        const askMap = this.asks.get(assetId) || new Map();
 
-        const trades = this.trades.get(assetId) || [];
-        trades.push(trade);
-        if (trades.length > 50) trades.splice(0, trades.length - 50);
-        this.trades.set(assetId, trades);
+        const bids = Array.from(bidMap.entries())
+            .map(([price, size]) => ({ price, size }))
+            .sort((a, b) => b.price - a.price);
 
-        if (this.onTradeUpdate) {
-            this.onTradeUpdate(assetId, trade);
-        }
+        const asks = Array.from(askMap.entries())
+            .map(([price, size]) => ({ price, size }))
+            .sort((a, b) => a.price - b.price);
+
+        return { bids, asks };
     }
 
     /**
      * Check if a simulated order would fill based on current orderbook.
-     * @param {string} assetId - token ID
-     * @param {'buy'|'sell'} side - order side
-     * @param {number} price - limit price
-     * @param {number} size - order size
-     * @returns {{ filled: number, avgPrice: number } | null}
      */
     checkSimFill(assetId, side, price, size) {
-        const book = this.books.get(assetId);
-        if (!book) return null;
+        const book = this.getBook(assetId);
 
         if (side === 'buy') {
-            // Buy order fills against asks at or below our price
             const eligible = book.asks.filter((a) => a.price <= price);
             if (eligible.length === 0) return null;
 
@@ -213,7 +275,6 @@ export class OrderbookWs {
                 return { filled: Math.min(filled, size), avgPrice: totalCost / filled };
             }
         } else {
-            // Sell order fills against bids at or above our price
             const eligible = book.bids.filter((b) => b.price >= price);
             if (eligible.length === 0) return null;
 
@@ -234,12 +295,23 @@ export class OrderbookWs {
         return null;
     }
 
-    getBook(assetId) {
-        return this.books.get(assetId) || { bids: [], asks: [] };
-    }
-
     getLastPrice(assetId) {
         return this.lastPrice.get(assetId) || 0;
+    }
+
+    getBestBid(assetId) {
+        // Try from price_change data first, fallback to computed from book
+        const cached = this.bestBid.get(assetId);
+        if (cached) return cached;
+        const book = this.getBook(assetId);
+        return book.bids[0]?.price || 0;
+    }
+
+    getBestAsk(assetId) {
+        const cached = this.bestAsk.get(assetId);
+        if (cached) return cached;
+        const book = this.getBook(assetId);
+        return book.asks[0]?.price || 0;
     }
 
     getRecentTrades(assetId, limit = 10) {
@@ -251,7 +323,7 @@ export class OrderbookWs {
         this.stopPing();
         this.pingTimer = setInterval(() => {
             if (this.ws?.readyState === WebSocket.OPEN) {
-                this.ws.send('ping');
+                this.ws.ping(); // Use proper WebSocket ping frames
             }
         }, PING_INTERVAL);
     }
