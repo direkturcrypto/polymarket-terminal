@@ -11,7 +11,8 @@ Developer and AI agent reference for understanding, extending, and maintaining t
 | Bot | Entry Point | Command | Purpose |
 |---|---|---|---|
 | Copy Trade | `src/index.js` | `npm start` | Mirror trades from a target trader wallet |
-| Market Maker | `src/mm.js` | `npm run mm` | Provide liquidity on 5m/15m binary markets |
+| Market Maker v1 | `src/mm.js` | `npm run mm` | Provide liquidity via splitPosition on 5m/15m markets |
+| Market Maker v2 | `src/maker.js` | `npm run maker` | Buy low, sell high — pure orderbook maker (no splitPosition) |
 | Orderbook Sniper | `src/sniper.js` | `npm run sniper` | Place low-price GTC orders to catch panic dumps |
 
 ---
@@ -91,9 +92,10 @@ All files use **ES Modules** (`import`/`export`). Do not use `require()`.
 
 - Loads all settings from `.env` via `dotenv`
 - Parses and validates required fields per bot type
-- Exports two validator functions:
+- Exports three validator functions:
   - `validateCopyTradeConfig()` — for `src/index.js`
   - `validateMMConfig()` — for `src/mm.js` and `src/sniper.js`
+  - `validateMakerConfig()` — for `src/maker.js`
 - Key exported fields: `privateKey`, `proxyWallet`, `traderAddress`, `dryRun`, `mmTradeSize`, etc.
 
 ### Client (`src/services/client.js`)
@@ -170,6 +172,23 @@ Used exclusively by the Market Maker bot. Interacts with the Gnosis Safe proxy w
 - `monitorAndManage(...)` — Watches for fill events; triggers cut-loss when `MM_CUT_LOSS_TIME` is reached
 - `cutLoss(...)` — Cancels remaining orders; merges back or market-sells residual tokens
 - `attemptRecoveryBuy(...)` — Optional directional bet post cut-loss (controlled by `MM_RECOVERY_BUY`)
+
+### Maker Detector (`src/services/makerDetector.js`)
+
+- Slot-based detection for the Maker v2 bot (buy low, sell high)
+- Supports **multiple durations** simultaneously (e.g. `MAKER_DURATION=5m,15m`)
+- Polls all `asset × duration` combinations in parallel
+- Each detected market includes a `duration` field for concurrent queue management
+- Same slug format as other bots: `{asset}-updown-{duration}-{timestamp}`
+
+### Maker Executor (`src/services/makerExecutor.js`)
+
+- `executeMakerStrategy(market)` — Full flow: place limit BUY on UP+DOWN → monitor fills → place limit SELL → monitor sells
+- **CL at 10s before close:** Cancels unfilled buy orders, places sells for any filled positions (retry 3x for settlement delays)
+- **Sell phase:** Sell orders stay live until market close (no early cancellation)
+- **Multi-market concurrent:** Each position keyed by `conditionId`, queue keyed by `${asset}-${duration}`
+- Simulation mode with full P&L tracking (win/loss/skip stats)
+- `placeLimitSellWithRetry()` — Retries sell placement 3x with increasing delay for on-chain settlement
 
 ### Sniper Detector (`src/services/sniperDetector.js`)
 

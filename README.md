@@ -34,12 +34,22 @@
 - **Per-Market Queue** — Concurrent events for the same market are serialized to prevent duplicate buys
 - **Dry Run Mode** — Simulate the full flow without placing real orders
 
-### Market Maker Bot
+### Market Maker v1 Bot (Split Position)
 - **Automated Liquidity** — Splits USDC into YES+NO tokens and places limit sells on both sides at $0.50 entry
 - **Cut-Loss Protection** — Merges unsold tokens back to USDC before market close
 - **Recovery Buy** — Optional directional bet after a cut-loss triggers
 - **Multi-Asset** — Supports BTC, ETH, SOL, and any 5m/15m Polymarket market
 - **Simulation Mode** — Full dry-run with P&L tracking
+
+### Market Maker v2 Bot (Buy Low, Sell High)
+- **Pure Orderbook** — Places limit BUY on both UP+DOWN at low price (e.g. 2c), sells at higher price (e.g. 3c) when filled. No splitPosition needed
+- **Cut-Loss at 10s** — Cancels unfilled buy orders 10 seconds before market close; sells positions as much as possible
+- **Sell Retry 3x** — Retries sell placement with delay for on-chain token settlement
+- **Multi-Asset** — Supports BTC, ETH, SOL, XRP simultaneously
+- **Multi-Duration** — Run 5m and 15m markets concurrently (`MAKER_DURATION=5m,15m`)
+- **Concurrent Markets** — Each asset+duration combination runs independently (e.g. BTC/5m and BTC/15m don't block each other)
+- **Simulation Mode** — Full dry-run with win/loss/skip tracking and P&L stats
+- **Proxy Support** — All API calls go through `PROXY_URL` if configured
 
 ### Orderbook Sniper Bot
 - **3-Tier Strategy** — Places GTC BUY orders at 3c, 2c, and 1c with weighted sizing (20%/30%/50%)
@@ -138,6 +148,20 @@ Leave these blank to have the client auto-derive credentials from your private k
 | `MM_RECOVERY_THRESHOLD` | Minimum dominant-side price to qualify for recovery | `0.70` |
 | `MM_RECOVERY_SIZE` | USDC for recovery buy (0 = use `MM_TRADE_SIZE`) | `0` |
 
+### Market Maker v2 (Maker) Settings
+
+| Variable | Description | Default |
+|---|---|---|
+| `MAKER_ASSETS` | Comma-separated assets (e.g. `btc,eth,sol,xrp`) | `btc` |
+| `MAKER_DURATION` | Comma-separated durations (e.g. `5m` or `5m,15m`) | `5m` |
+| `MAKER_BUY_PRICE` | Limit BUY price per share (e.g. `0.02` = 2c) | `0.02` |
+| `MAKER_SELL_PRICE` | Limit SELL price per share (e.g. `0.03` = 3c) | `0.03` |
+| `MAKER_TRADE_SIZE` | Shares per side (e.g. `50` × $0.02 = $1.00/side) | `50` |
+| `MAKER_POLL_INTERVAL` | Seconds between new market polls | `10` |
+| `MAKER_MONITOR_MS` | Milliseconds between order fill checks | `2000` |
+
+**Cut-Loss:** At 10 seconds before market close, unfilled buy orders are cancelled. Any filled positions get sell orders placed (retry 3x). Sell orders stay live until market close.
+
 ### Orderbook Sniper Settings
 
 **3-Tier Strategy:** Places orders at 3 price levels with weighted sizing
@@ -179,6 +203,11 @@ npm run mm          # live trading
 npm run mm-sim      # simulation (DRY_RUN=true)
 npm run mm-dev      # simulation + auto-reload
 
+# Market Maker v2 (Maker) Bot
+npm run maker       # live trading
+npm run maker-sim   # simulation
+npm run maker-dev   # simulation + auto-reload
+
 # Orderbook Sniper Bot
 npm run sniper      # live trading
 npm run sniper-sim  # simulation
@@ -195,10 +224,15 @@ npm run bot         # live trading
 npm run bot-sim     # simulation
 npm run bot-dev     # simulation + auto-reload
 
-# Market Maker Bot
+# Market Maker v1 Bot
 npm run mm-bot      # live trading
 npm run mm-bot-sim  # simulation
 npm run mm-bot-dev  # simulation + auto-reload
+
+# Market Maker v2 (Maker) Bot
+npm run maker-bot      # live trading
+npm run maker-bot-sim  # simulation
+npm run maker-bot-dev  # simulation + auto-reload
 ```
 
 > **Always test with `DRY_RUN=true` (or `*-sim` scripts) first** before committing real funds.
@@ -288,7 +322,7 @@ Redeemer loop (every REDEEM_INTERVAL seconds)
   → Check on-chain payout → redeemPositions via Gnosis Safe
 ```
 
-### Market Maker Flow
+### Market Maker v1 Flow (Split Position)
 
 ```
 New Market Detected
@@ -311,6 +345,37 @@ Collect  Cancel orders → Merge YES+NO back to USDC
  profit    (recovery buy optional)
 ```
 
+### Market Maker v2 Flow (Buy Low, Sell High)
+
+```
+Detector polls all asset × duration combos (e.g. BTC/5m, ETH/15m)
+        │
+        ▼
+Place limit BUY on UP + DOWN @ MAKER_BUY_PRICE (e.g. $0.02)
+        │
+        ▼
+Monitor both sides concurrently
+        │
+   ┌────┴─────────────────┐
+   │                      │
+ One side fills     CL at 10s before close
+   │                      │
+   ▼                      ▼
+Cancel other buy    Cancel unfilled buys
+Place SELL @ 3c     Place SELL for any fills (retry 3x)
+   │                      │
+   └──────┬───────────────┘
+          ▼
+Monitor sells until market close
+          │
+     ┌────┴────┐
+     │         │
+  Sell fills  Market closes
+     │         │
+     ▼         ▼
+   WIN $     Tokens resolve on-chain
+```
+
 ---
 
 ## Project Structure
@@ -320,8 +385,10 @@ polymarket-terminal/
 ├── src/
 │   ├── index.js               — Copy trade bot (TUI)
 │   ├── bot.js                 — Copy trade bot (plain log / PM2)
-│   ├── mm.js                  — Market maker bot (TUI)
-│   ├── mm-bot.js              — Market maker bot (plain log / PM2)
+│   ├── mm.js                  — Market maker v1 bot (TUI)
+│   ├── mm-bot.js              — Market maker v1 bot (plain log / PM2)
+│   ├── maker.js               — Market maker v2 bot (TUI)
+│   ├── maker-bot.js           — Market maker v2 bot (plain log / PM2)
 │   ├── sniper.js              — Orderbook sniper bot
 │   │
 │   ├── config/
@@ -336,8 +403,11 @@ polymarket-terminal/
 │   │   ├── autoSell.js        — Auto limit-sell placement
 │   │   ├── redeemer.js        — Market resolution check & CTF redemption
 │   │   ├── ctf.js             — On-chain CTF contract interactions
-│   │   ├── mmDetector.js      — Market detection for market maker
-│   │   ├── mmExecutor.js      — Market maker strategy execution
+│   │   ├── mmDetector.js      — Market detection for MM v1
+│   │   ├── mmExecutor.js      — MM v1 strategy execution
+│   │   ├── makerDetector.js   — Market detection for Maker v2 (multi-duration)
+│   │   ├── makerExecutor.js   — Maker v2 strategy execution
+│   │   ├── makerWs.js         — Orderbook WebSocket for Maker v2
 │   │   ├── sniperDetector.js  — Market detection for sniper
 │   │   └── sniperExecutor.js  — Orderbook sniper order placement
 │   │

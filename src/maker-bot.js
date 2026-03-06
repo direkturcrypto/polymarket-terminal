@@ -98,7 +98,14 @@ async function printStatus() {
 
 const pendingByAsset = new Map();
 
+function slotKey(market) {
+    return `${market.asset}-${market.duration || '5m'}`;
+}
+
 async function runStrategy(market) {
+    const key = slotKey(market);
+    const tag = `${market.asset?.toUpperCase()}/${market.duration || '5m'}`;
+
     if (config.dryRun) {
         orderbookWs.subscribe(market.conditionId, [market.yesTokenId, market.noTokenId]);
     }
@@ -106,30 +113,32 @@ async function runStrategy(market) {
     try {
         await executeMakerStrategy(market);
     } catch (err) {
-        logger.error(`MAKER strategy error (${market.asset?.toUpperCase()}): ${err.message}`);
+        logger.error(`MAKER strategy error (${tag}): ${err.message}`);
     }
 
-    const queued = pendingByAsset.get(market.asset);
+    const queued = pendingByAsset.get(key);
     if (queued) {
-        pendingByAsset.delete(market.asset);
+        pendingByAsset.delete(key);
         const secsLeft = Math.round((new Date(queued.endTime).getTime() - Date.now()) / 1000);
 
         if (secsLeft > 30) {
-            logger.success(`MAKER[${market.asset?.toUpperCase()}]: executing queued market (${secsLeft}s left)`);
+            logger.success(`MAKER[${tag}]: executing queued market (${secsLeft}s left)`);
             runStrategy(queued);
         } else {
-            logger.warn(`MAKER[${market.asset?.toUpperCase()}]: queued market expired (${secsLeft}s left)`);
+            logger.warn(`MAKER[${tag}]: queued market expired (${secsLeft}s left)`);
         }
     }
 }
 
 async function handleNewMarket(market) {
+    const key = slotKey(market);
+    const tag = `${market.asset?.toUpperCase()}/${market.duration || '5m'}`;
     const active = getActiveMakerPositions();
-    const isAssetBusy = active.some((p) => p.asset === market.asset);
+    const isSlotBusy = active.some((p) => p.asset === market.asset && p.duration === (market.duration || '5m'));
 
-    if (isAssetBusy) {
-        pendingByAsset.set(market.asset, market);
-        logger.warn(`MAKER[${market.asset?.toUpperCase()}]: queued — will enter after current position clears`);
+    if (isSlotBusy) {
+        pendingByAsset.set(key, market);
+        logger.warn(`MAKER[${tag}]: queued — will enter after current position clears`);
         return;
     }
 
@@ -161,14 +170,14 @@ const profitPerCycle = (config.makerSellPrice - config.makerBuyPrice) * config.m
 
 logger.info(`=== Market Maker v2 [${mode}] ===`);
 logger.info(`Assets    : ${config.makerAssets.join(', ').toUpperCase()}`);
-logger.info(`Duration  : ${config.makerDuration}`);
+logger.info(`Duration  : ${config.makerDurations.join(', ')}`);
 logger.info(`Buy @     : $${config.makerBuyPrice} per share`);
 logger.info(`Sell @    : $${config.makerSellPrice} per share`);
 logger.info(`Size      : ${config.makerTradeSize} shares/side`);
 logger.info(`Cost/side : $${costPerSide.toFixed(2)}`);
 logger.info(`Profit    : $${profitPerCycle.toFixed(2)} per cycle`);
-logger.info(`Cut loss  : NONE (hold to resolution)`);
+logger.info(`CL        : cancel buys at 10s, sell until close`);
 logger.info('==========================================');
 
 startMakerDetector(handleNewMarket);
-logger.success(`MAKER bot started — watching for ${config.makerDuration} ${config.makerAssets.join('/')} markets...`);
+logger.success(`MAKER bot started — watching for ${config.makerDurations.join('+')} ${config.makerAssets.join('/')} markets...`);

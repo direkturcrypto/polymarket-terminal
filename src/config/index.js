@@ -108,7 +108,8 @@ const config = {
   // No splitPosition — pure orderbook strategy.
   makerAssets: (process.env.MAKER_ASSETS || 'btc')
     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
-  makerDuration: process.env.MAKER_DURATION || '5m',
+  makerDurations: (process.env.MAKER_DURATION || '5m')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
   makerBuyPrice: parseFloat(process.env.MAKER_BUY_PRICE || '0.02'),
   makerSellPrice: parseFloat(process.env.MAKER_SELL_PRICE || '0.03'),
   makerTradeSize: parseFloat(process.env.MAKER_TRADE_SIZE || '50'),    // shares per side

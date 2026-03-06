@@ -11,8 +11,9 @@
  *      b. Place limit SELL for filled shares at makerSellPrice (e.g. 3c)
  *      c. Cancel the other side's buy order
  *   5. Partial fills → partial sells placed immediately
- *   6. Monitor sell orders until filled or 10s before market close
- *   7. CL at 10s: cancel unfilled sell orders (tokens resolve on-chain)
+ *   6. CL at 10s before close: cancel unfilled buy orders
+ *   7. Place sells for any filled positions (retry 3x if settlement pending)
+ *   8. Monitor sell orders until filled or market close
  */
 
 import { Side, OrderType } from '@polymarket/clob-client';
@@ -188,8 +189,8 @@ async function simCheckFill(tokenId, side, price) {
 // ── Core strategy ─────────────────────────────────────────────────────────────
 
 export async function executeMakerStrategy(market) {
-    const { asset, conditionId, question, endTime, yesTokenId, noTokenId, negRisk, tickSize } = market;
-    const tag = asset ? `[${asset.toUpperCase()}]` : '';
+    const { asset, duration, conditionId, question, endTime, yesTokenId, noTokenId, negRisk, tickSize } = market;
+    const tag = asset ? `[${asset.toUpperCase()}/${duration || '5m'}]` : '';
     const label = question.substring(0, 40);
     const sim = config.dryRun ? '[SIM] ' : '';
     const { makerBuyPrice, makerSellPrice, makerTradeSize, makerMonitorMs } = config;
@@ -228,6 +229,7 @@ export async function executeMakerStrategy(market) {
     // ── 2. Build position state ──────────────────────────────────
     const pos = {
         asset: asset || 'btc',
+        duration: duration || '5m',
         conditionId,
         question,
         endTime,
@@ -306,7 +308,15 @@ async function monitorBuyPhase(pos, tag, sim) {
 
         while (!pos.winner) {
             const msLeft = new Date(pos.endTime).getTime() - Date.now();
-            if (msLeft <= 0) break;
+            // CL: cancel unfilled buy at 10s before market close
+            if (msLeft <= CL_SECONDS * 1000) {
+                if (side.buyOrderId && !side.cancelled) {
+                    logger.warn(`MAKER${tag}: CL ${CL_SECONDS}s — cancelling ${sideName} buy`);
+                    await cancelOrder(side.buyOrderId);
+                    side.cancelled = true;
+                }
+                break;
+            }
 
             // Check fill
             let fill;
@@ -376,6 +386,45 @@ async function monitorBuyPhase(pos, tag, sim) {
         monitorSide('down'),
     ]);
 
+    // Cleanup: cancel any remaining unfilled buy orders
+    for (const key of ['up', 'down']) {
+        const s = pos[key];
+        if (s.buyOrderId && !s.cancelled) {
+            await cancelOrder(s.buyOrderId);
+            s.cancelled = true;
+            logger.info(`MAKER${tag}: cancelled ${key.toUpperCase()} buy order`);
+        }
+    }
+
+    // Place sells for filled buys that don't have sell orders yet
+    for (const key of ['up', 'down']) {
+        const s = pos[key];
+        const soldShares = s.sellOrders.reduce((sum, so) => sum + so.shares, 0);
+        const unsold = s.buyFilled - soldShares;
+        if (unsold > 0) {
+            logger.info(`MAKER${tag}: placing sell for ${key.toUpperCase()} ${unsold.toFixed(2)} unsold shares`);
+            if (!config.dryRun) {
+                logger.info(`MAKER${tag}: waiting ${SELL_DELAY_MS / 1000}s for on-chain settlement...`);
+                await sleep(SELL_DELAY_MS);
+            }
+            const sellResult = await placeLimitSellWithRetry(
+                s.tokenId, unsold, makerSellPrice,
+                pos.tickSize, pos.negRisk, tag,
+            );
+            if (sellResult.success) {
+                s.sellOrders.push({
+                    orderId: sellResult.orderId,
+                    shares: unsold,
+                    filled: false,
+                    fillPrice: null,
+                });
+                logger.trade(`MAKER${tag}: ${sim}${key.toUpperCase()} SELL placed ${unsold.toFixed(2)} shares @ $${makerSellPrice}`);
+            } else {
+                logger.error(`MAKER${tag}: ${key.toUpperCase()} SELL failed after ${MAX_SELL_RETRIES} retries — tokens held to resolution`);
+            }
+        }
+    }
+
     if (!pos.winner) {
         const anyFill = pos.up.buyFilled > 0 || pos.down.buyFilled > 0;
         if (anyFill) {
@@ -389,7 +438,7 @@ async function monitorBuyPhase(pos, tag, sim) {
     }
 }
 
-// ── Sell phase: monitor sell orders, CL at 10s before close ──────────────────
+// ── Sell phase: monitor sell orders until market close ────────────────────────
 
 async function monitorSellPhase(pos, tag, sim) {
     if (pos.status === 'done') return;
@@ -413,19 +462,12 @@ async function monitorSellPhase(pos, tag, sim) {
     while (true) {
         const msLeft = new Date(pos.endTime).getTime() - Date.now();
 
-        // ── CL at 10s: cancel unfilled sells, let tokens resolve on-chain ──
-        if (msLeft <= CL_SECONDS * 1000) {
-            let unfilledCount = 0;
-            for (const so of side.sellOrders) {
-                if (!so.filled) {
-                    await cancelOrder(so.orderId);
-                    unfilledCount++;
-                }
-            }
-            if (unfilledCount > 0) {
-                logger.warn(`MAKER${tag}: CL ${CL_SECONDS}s — cancelled ${unfilledCount} unfilled sell order(s), held to resolution`);
-            }
+        // Market closed — unfilled sells resolve on-chain
+        if (msLeft <= 0) {
             pos.status = side.totalSellFilled > 0 ? 'done' : 'expired-holding';
+            if (pos.status === 'expired-holding') {
+                logger.warn(`MAKER${tag}: market closed — unfilled sells held to resolution`);
+            }
             break;
         }
 

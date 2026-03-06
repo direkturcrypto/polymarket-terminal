@@ -93,13 +93,13 @@ async function buildStatusContent() {
     // Maker Config
     lines.push('{bold}MAKER CONFIG{/bold}');
     lines.push(`  Assets   : ${config.makerAssets.join(', ').toUpperCase()}`);
-    lines.push(`  Duration : ${config.makerDuration}`);
+    lines.push(`  Duration : ${config.makerDurations.join(', ')}`);
     lines.push(`  Buy @    : $${config.makerBuyPrice} per share`);
     lines.push(`  Sell @   : $${config.makerSellPrice} per share`);
     lines.push(`  Size     : ${config.makerTradeSize} shares/side`);
     lines.push(`  Cost/side: $${(config.makerTradeSize * config.makerBuyPrice).toFixed(2)}`);
     lines.push(`  Profit   : $${((config.makerSellPrice - config.makerBuyPrice) * config.makerTradeSize).toFixed(2)}/cycle`);
-    lines.push(`  No CL    : hold to resolution if sell unfilled`);
+    lines.push(`  CL       : cancel buys at ${config.makerCLSeconds || 10}s, sell until close`);
     lines.push('');
 
     // Active positions
@@ -110,7 +110,7 @@ async function buildStatusContent() {
         lines.push('  {gray-fg}Waiting for market...{/gray-fg}');
     } else {
         for (const pos of positions) {
-            const assetTag = pos.asset ? `[${pos.asset.toUpperCase()}] ` : '';
+            const assetTag = pos.asset ? `[${pos.asset.toUpperCase()}/${pos.duration || '5m'}] ` : '';
             const label = pos.question.substring(0, 32);
             const msLeft = new Date(pos.endTime).getTime() - Date.now();
             const secsLeft = Math.max(0, Math.round(msLeft / 1000));
@@ -200,7 +200,14 @@ function startRefresh() {
 
 const pendingByAsset = new Map();
 
+function slotKey(market) {
+    return `${market.asset}-${market.duration || '5m'}`;
+}
+
 async function runStrategy(market) {
+    const key = slotKey(market);
+    const tag = `${market.asset?.toUpperCase()}/${market.duration || '5m'}`;
+
     // Connect WebSocket for orderbook visualization in sim mode
     if (config.dryRun) {
         activeWsTokens = { up: market.yesTokenId, down: market.noTokenId };
@@ -210,7 +217,7 @@ async function runStrategy(market) {
     try {
         await executeMakerStrategy(market);
     } catch (err) {
-        logger.error(`MAKER strategy error (${market.asset?.toUpperCase()}): ${err.message}`);
+        logger.error(`MAKER strategy error (${tag}): ${err.message}`);
     }
 
     // Disconnect WS after strategy ends
@@ -219,28 +226,30 @@ async function runStrategy(market) {
     }
 
     // Process queued market
-    const queued = pendingByAsset.get(market.asset);
+    const queued = pendingByAsset.get(key);
     if (queued) {
-        pendingByAsset.delete(market.asset);
+        pendingByAsset.delete(key);
         const endMs = new Date(queued.endTime).getTime();
         const secsLeft = Math.round((endMs - Date.now()) / 1000);
 
         if (secsLeft > 30) {
-            logger.success(`MAKER[${market.asset?.toUpperCase()}]: executing queued market (${secsLeft}s left)`);
+            logger.success(`MAKER[${tag}]: executing queued market (${secsLeft}s left)`);
             runStrategy(queued);
         } else {
-            logger.warn(`MAKER[${market.asset?.toUpperCase()}]: queued market expired (${secsLeft}s left)`);
+            logger.warn(`MAKER[${tag}]: queued market expired (${secsLeft}s left)`);
         }
     }
 }
 
 async function handleNewMarket(market) {
+    const key = slotKey(market);
+    const tag = `${market.asset?.toUpperCase()}/${market.duration || '5m'}`;
     const active = getActiveMakerPositions();
-    const isAssetBusy = active.some((p) => p.asset === market.asset);
+    const isSlotBusy = active.some((p) => p.asset === market.asset && p.duration === (market.duration || '5m'));
 
-    if (isAssetBusy) {
-        pendingByAsset.set(market.asset, market);
-        logger.warn(`MAKER[${market.asset?.toUpperCase()}]: queued — will enter after current position clears`);
+    if (isSlotBusy) {
+        pendingByAsset.set(key, market);
+        logger.warn(`MAKER[${tag}]: queued — will enter after current position clears`);
         return;
     }
 
@@ -265,7 +274,7 @@ process.on('SIGTERM', shutdown);
 const costPerSide = config.makerTradeSize * config.makerBuyPrice;
 const profitPerCycle = (config.makerSellPrice - config.makerBuyPrice) * config.makerTradeSize;
 logger.info(`MAKER starting — ${config.dryRun ? 'SIMULATION' : 'LIVE'}`);
-logger.info(`Assets: ${config.makerAssets.join(', ').toUpperCase()} | BUY @ $${config.makerBuyPrice} → SELL @ $${config.makerSellPrice}`);
+logger.info(`Assets: ${config.makerAssets.join(', ').toUpperCase()} | Durations: ${config.makerDurations.join(', ')} | BUY @ $${config.makerBuyPrice} → SELL @ $${config.makerSellPrice}`);
 logger.info(`Size: ${config.makerTradeSize} sh/side | Cost: $${costPerSide.toFixed(2)}/side | Profit: $${profitPerCycle.toFixed(2)}/cycle`);
 
 startRefresh();

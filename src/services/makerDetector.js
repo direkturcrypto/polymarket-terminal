@@ -1,29 +1,34 @@
 /**
  * makerDetector.js
  * Detects upcoming markets for the Maker strategy (buy low, sell high).
- * Same slug-based detection as mmDetector but reads from MAKER_* config.
+ * Supports multiple assets AND multiple durations (e.g. 5m,15m).
  */
 
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 import { proxyFetch } from '../utils/proxy.js';
 
-const SLOT_SEC = config.makerDuration === '15m' ? 900 : 300;
+const DURATION_SECS = { '5m': 300, '15m': 900 };
 
 let pollTimer = null;
 let onMarketCb = null;
 const seenKeys = new Set();
 
-function currentSlot() {
-    return Math.floor(Date.now() / 1000 / SLOT_SEC) * SLOT_SEC;
+function slotSec(duration) {
+    return DURATION_SECS[duration] || 300;
 }
 
-function nextSlot() {
-    return currentSlot() + SLOT_SEC;
+function currentSlot(duration) {
+    const sec = slotSec(duration);
+    return Math.floor(Date.now() / 1000 / sec) * sec;
 }
 
-async function fetchBySlug(asset, slotTimestamp) {
-    const slug = `${asset}-updown-${config.makerDuration}-${slotTimestamp}`;
+function nextSlot(duration) {
+    return currentSlot(duration) + slotSec(duration);
+}
+
+async function fetchBySlug(asset, duration, slotTimestamp) {
+    const slug = `${asset}-updown-${duration}-${slotTimestamp}`;
     try {
         const resp = await proxyFetch(`${config.gammaHost}/markets/slug/${slug}`);
         if (!resp.ok) return null;
@@ -34,7 +39,7 @@ async function fetchBySlug(asset, slotTimestamp) {
     }
 }
 
-function extractMarketData(market, asset) {
+function extractMarketData(market, asset, duration) {
     const conditionId = market.conditionId || market.condition_id || '';
     if (!conditionId) return null;
 
@@ -55,6 +60,7 @@ function extractMarketData(market, asset) {
 
     return {
         asset,
+        duration,
         conditionId,
         question: market.question || market.title || '',
         endTime: market.endDate || market.end_date_iso || market.endDateIso,
@@ -66,16 +72,16 @@ function extractMarketData(market, asset) {
     };
 }
 
-async function scheduleAsset(asset, slotTimestamp) {
-    const key = `${asset}-${slotTimestamp}`;
+async function scheduleAsset(asset, duration, slotTimestamp) {
+    const key = `${asset}-${duration}-${slotTimestamp}`;
     if (seenKeys.has(key)) return;
 
-    const market = await fetchBySlug(asset, slotTimestamp);
+    const market = await fetchBySlug(asset, duration, slotTimestamp);
     if (!market) return;
 
-    const data = extractMarketData(market, asset);
+    const data = extractMarketData(market, asset, duration);
     if (!data) {
-        logger.warn(`MAKER: skipping ${asset.toUpperCase()} slot ${slotTimestamp} — missing token IDs`);
+        logger.warn(`MAKER: skipping ${asset.toUpperCase()} ${duration} slot ${slotTimestamp} — missing token IDs`);
         seenKeys.add(key);
         return;
     }
@@ -85,15 +91,15 @@ async function scheduleAsset(asset, slotTimestamp) {
     const openAt = data.eventStartTime ? new Date(data.eventStartTime).getTime() : slotTimestamp * 1000;
     const elapsedSec = Math.round((Date.now() - openAt) / 1000);
     if (elapsedSec > 15) {
-        logger.info(`MAKER: ${asset.toUpperCase()} next slot already ${elapsedSec}s old — skipping`);
+        logger.info(`MAKER: ${asset.toUpperCase()} ${duration} next slot already ${elapsedSec}s old — skipping`);
         return;
     }
 
     const secsUntilOpen = Math.round((openAt - Date.now()) / 1000);
     if (secsUntilOpen > 0) {
-        logger.success(`MAKER: ${asset.toUpperCase()} found "${data.question.slice(0, 40)}" — placing orders (${secsUntilOpen}s before open)`);
+        logger.success(`MAKER: ${asset.toUpperCase()} ${duration} found "${data.question.slice(0, 40)}" — placing orders (${secsUntilOpen}s before open)`);
     } else {
-        logger.success(`MAKER: ${asset.toUpperCase()} found "${data.question.slice(0, 40)}" — placing orders now`);
+        logger.success(`MAKER: ${asset.toUpperCase()} ${duration} found "${data.question.slice(0, 40)}" — placing orders now`);
     }
 
     if (onMarketCb) onMarketCb(data);
@@ -101,8 +107,14 @@ async function scheduleAsset(asset, slotTimestamp) {
 
 async function poll() {
     try {
-        const next = nextSlot();
-        await Promise.all(config.makerAssets.map((asset) => scheduleAsset(asset, next)));
+        const tasks = [];
+        for (const duration of config.makerDurations) {
+            const next = nextSlot(duration);
+            for (const asset of config.makerAssets) {
+                tasks.push(scheduleAsset(asset, duration, next));
+            }
+        }
+        await Promise.all(tasks);
     } catch (err) {
         logger.error('MAKER detector poll error:', err.message);
     }
@@ -115,10 +127,13 @@ export function startMakerDetector(onNewMarket) {
     poll();
     pollTimer = setInterval(poll, config.makerPollInterval);
 
-    const ns = nextSlot();
-    const secsUntil = ns - Math.floor(Date.now() / 1000);
-    logger.info(`MAKER detector started — assets: ${config.makerAssets.join(', ').toUpperCase()} | duration: ${config.makerDuration}`);
-    logger.info(`Next slot: *-updown-${config.makerDuration}-${ns} (opens in ${secsUntil}s)`);
+    const durStr = config.makerDurations.join(', ');
+    for (const duration of config.makerDurations) {
+        const ns = nextSlot(duration);
+        const secsUntil = ns - Math.floor(Date.now() / 1000);
+        logger.info(`MAKER detector — ${duration}: next slot *-updown-${duration}-${ns} (opens in ${secsUntil}s)`);
+    }
+    logger.info(`MAKER detector started — assets: ${config.makerAssets.join(', ').toUpperCase()} | durations: ${durStr}`);
     logger.info(`Strategy: BUY @ $${config.makerBuyPrice} → SELL @ $${config.makerSellPrice} | ${config.makerTradeSize} shares/side`);
 }
 
