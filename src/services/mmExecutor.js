@@ -517,11 +517,17 @@ async function adaptiveLegCL(pos, unfilledKey) {
     let currentFloor     = is5m ? breakevenFloor : minAdaptivePrice;
 
     if (is5m && sellShares >= CLOB_MIN_ORDER_SHARES) {
-        logger.info(`MM adaptive CL: placing standing limit sell @ $${breakevenFloor.toFixed(3)} (breakeven floor)`);
-        const standing = await placeLimitSell(s.tokenId, sellShares, breakevenFloor, tickSize, negRisk);
+        // Check mid price first — place at market price (not just breakeven floor)
+        const initMid = await getMidprice(s.tokenId);
+        // Use mid price if above floor, otherwise use floor as safety net
+        const initSellPrice = initMid >= currentFloor
+            ? Math.min(initMid, config.mmSellPrice)
+            : currentFloor;
+        logger.info(`MM adaptive CL: mid=$${initMid.toFixed(3)}, placing initial limit sell @ $${initSellPrice.toFixed(3)} (floor=$${currentFloor.toFixed(3)})`);
+        const standing = await placeLimitSell(s.tokenId, sellShares, initSellPrice, tickSize, negRisk);
         if (standing.success) {
             activeOrderId    = standing.orderId;
-            activeLimitPrice = breakevenFloor;
+            activeLimitPrice = initSellPrice;
         }
     } else {
         logger.info(`MM adaptive CL: monitoring ${unfilledKey.toUpperCase()} — floor $${currentFloor.toFixed(3)}, market-sell at CL time`);
