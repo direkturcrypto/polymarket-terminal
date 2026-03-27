@@ -6,6 +6,9 @@
  *   pm2 logs polymarket-mm
  */
 
+// Set proxy before any network calls
+import './utils/proxy-patch.cjs';
+
 import { validateMMConfig } from './config/index.js';
 import config from './config/index.js';
 import logger from './utils/logger.js';
