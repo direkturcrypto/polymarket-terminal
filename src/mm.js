@@ -16,6 +16,7 @@ import { initClient, getClient } from './services/client.js';
 import { initDashboard, appendLog, updateStatus, isDashboardActive } from './ui/dashboard.js';
 import { startMMDetector, stopMMDetector } from './services/mmDetector.js';
 import { executeMMStrategy, getActiveMMPositions } from './services/mmExecutor.js';
+import { mmFillWatcher } from './services/mmWsFillWatcher.js';
 import { getUsdcBalance } from './services/client.js';
 import { cleanupOpenPositions, redeemMMPositions, MIN_SHARES_PER_SIDE } from './services/ctf.js';
 
@@ -52,7 +53,11 @@ if (config.mmTradeSize < MIN_SHARES_PER_SIDE) {
     process.exit(1);
 }
 
-// ── Cleanup leftover positions on startup ─────────────────────────────────────
+// ── Start WebSocket fill watcher for real-time order detection ────────────────
+
+mmFillWatcher.start();
+
+// ── Cleanup leftover positions on startup ─────────────────────────────────���───
 
 try {
     await cleanupOpenPositions(getClient());
@@ -210,6 +215,7 @@ async function handleNewMarket(market) {
 function shutdown() {
     logger.warn('MM: shutting down...');
     stopMMDetector();
+    mmFillWatcher.stop();
     if (refreshTimer) clearInterval(refreshTimer);
     if (redeemTimer)  clearInterval(redeemTimer);
     process.exit(0);

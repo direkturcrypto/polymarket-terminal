@@ -15,6 +15,7 @@ import logger from './utils/logger.js';
 import { initClient, getClient, getUsdcBalance } from './services/client.js';
 import { startMMDetector, stopMMDetector } from './services/mmDetector.js';
 import { executeMMStrategy, getActiveMMPositions } from './services/mmExecutor.js';
+import { mmFillWatcher } from './services/mmWsFillWatcher.js';
 import { cleanupOpenPositions, redeemMMPositions, MIN_SHARES_PER_SIDE } from './services/ctf.js';
 
 logger.interceptConsole();
@@ -46,6 +47,10 @@ if (config.mmTradeSize < MIN_SHARES_PER_SIDE) {
     );
     process.exit(1);
 }
+
+// ── Start WebSocket fill watcher for real-time order detection ────────────────
+
+mmFillWatcher.start();
 
 // ── Cleanup leftover positions on startup ─────────────────────────────────────
 
@@ -166,6 +171,7 @@ const redeemTimer = setInterval(
 function shutdown() {
     logger.warn('MM: shutting down...');
     stopMMDetector();
+    mmFillWatcher.stop();
     clearInterval(statusTimer);
     clearInterval(redeemTimer);
     setTimeout(() => process.exit(0), 300);

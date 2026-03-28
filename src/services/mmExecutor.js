@@ -14,6 +14,7 @@ import { ethers } from 'ethers';
 import config from '../config/index.js';
 import { getClient, getUsdcBalance, getPolygonProvider } from './client.js';
 import { splitPosition, mergePositions } from './ctf.js';
+import { mmFillWatcher } from './mmWsFillWatcher.js';
 import logger from '../utils/logger.js';
 
 // CTF contract for on-chain balance queries
@@ -39,6 +40,37 @@ async function getTokenBalance(tokenId) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Fallback poll interval — WS handles the fast path, this is the safety net
+const POLL_INTERVAL_MS = 30_000;
+
+/**
+ * Wait for a fill event from WebSocket OR timeout (polling fallback).
+ * Returns early if WS delivers a fill for any of the watched token IDs.
+ * @param {string[]} tokenIds - token IDs to listen for
+ * @param {number} timeoutMs - max wait time before returning for poll check
+ * @returns {Promise<{tokenId: string, size: number, price: number} | null>}
+ */
+function waitForFillOrTimeout(tokenIds, timeoutMs) {
+    return new Promise((resolve) => {
+        let timer;
+
+        const onFill = (event) => {
+            if (tokenIds.includes(event.tokenId)) {
+                clearTimeout(timer);
+                mmFillWatcher.removeListener('fill', onFill);
+                resolve(event);
+            }
+        };
+
+        mmFillWatcher.on('fill', onFill);
+
+        timer = setTimeout(() => {
+            mmFillWatcher.removeListener('fill', onFill);
+            resolve(null); // timeout — caller does poll check
+        }, timeoutMs);
+    });
+}
 
 // In-memory store of all active MM positions (conditionId → position)
 const activePositions = new Map();
@@ -216,11 +248,106 @@ async function getMidprice(tokenId) {
     } catch { return 0; }
 }
 
-// ── Core monitoring loop ──────────────────────────────────────────────────────
+// ── Per-side fill check (parallel-safe) ──────────────────────────────────────
+
+/**
+ * Check one side (yes/no) for fills and partial fills.
+ * Returns true if this side became fully filled during this check.
+ * Safe to run in parallel for both sides.
+ */
+async function checkSideFill(pos, key) {
+    const s = pos[key];
+    if (s.filled) return false;
+
+    const label = key.toUpperCase();
+    let filled = false;
+
+    if (config.dryRun) {
+        const hitPrice = await simPriceHitTarget(s.tokenId);
+        if (hitPrice) { filled = true; s.fillPrice = hitPrice; }
+    } else {
+        filled = await isOrderFilled(s.orderId, s.shares, s.tokenId);
+        if (filled) s.fillPrice = config.mmSellPrice;
+    }
+
+    if (filled) {
+        s.filled = true;
+        const pnl = (s.fillPrice - s.entryPrice) * s.shares;
+        logger.money(`MM${config.dryRun ? '[SIM]' : ''}: ${label} filled @ $${s.fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+        return true;
+    }
+
+    // Partial fill handling (live only)
+    if (config.dryRun) return false;
+
+    const info = await getPartialFillInfo(s.orderId, s.shares, s.tokenId);
+    if (info.matched > 0 && info.remaining > 0 && info.remaining < s.shares * 0.90) {
+        logger.warn(`MM: ${label} partially filled — ${info.matched.toFixed(3)}/${info.total.toFixed(3)} matched, ${info.remaining.toFixed(3)} remaining`);
+        await cancelOrder(s.orderId);
+        s.orderId = null;
+        s.shares  = info.remaining;
+        s._partialRevenue = (s._partialRevenue || 0) + info.matched * config.mmSellPrice;
+
+        if (info.remaining < CLOB_MIN_ORDER_SHARES) {
+            logger.warn(`MM: ${label} remaining ${info.remaining.toFixed(3)} < ${CLOB_MIN_ORDER_SHARES} min — market selling remainder`);
+            const result = await marketSell(s.tokenId, info.remaining, pos.tickSize, pos.negRisk);
+            s.fillPrice = config.mmSellPrice;
+            s.filled = true;
+            const pnl = (s._partialRevenue + result.fillPrice * info.remaining) - s.entryPrice * info.total;
+            logger.money(`MM: ${label} fully sold (partial+market) | P&L $${pnl.toFixed(2)}`);
+            return true;
+        } else {
+            const res = await placeLimitSell(s.tokenId, info.remaining, config.mmSellPrice, pos.tickSize, pos.negRisk);
+            if (res.success) {
+                s.orderId = res.orderId;
+                logger.info(`MM: ${label} re-placed limit sell for ${info.remaining.toFixed(3)} shares @ $${config.mmSellPrice}`);
+            }
+        }
+    }
+
+    return false;
+}
+
+// ── Core monitoring loop (event-driven + parallel) ───────────────────────────
 
 async function monitorAndManage(pos) {
     const label = pos.question.substring(0, 40);
 
+    // Register tokens with WS fill watcher for instant fill detection
+    mmFillWatcher.watch(pos.yes.tokenId);
+    mmFillWatcher.watch(pos.no.tokenId);
+
+    // Handle WS fill events — mark side as filled immediately
+    const onWsFill = (event) => {
+        for (const key of ['yes', 'no']) {
+            if (!pos[key].filled && event.tokenId === pos[key].tokenId && event.side === 'SELL') {
+                pos[key].filled = true;
+                pos[key].fillPrice = event.price || config.mmSellPrice;
+                const pnl = (pos[key].fillPrice - pos[key].entryPrice) * pos[key].shares;
+                logger.money(`MM: ${key.toUpperCase()} filled (WS realtime) @ $${pos[key].fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+            }
+        }
+    };
+    mmFillWatcher.on('fill', onWsFill);
+
+    try {
+        await _monitorLoop(pos, label);
+    } finally {
+        // Cleanup WS listeners
+        mmFillWatcher.removeListener('fill', onWsFill);
+        mmFillWatcher.unwatch(pos.yes.tokenId);
+        mmFillWatcher.unwatch(pos.no.tokenId);
+    }
+
+    // Final P&L log
+    const totalPnl = calcPnl(pos);
+    const sign = totalPnl >= 0 ? '+' : '';
+    if (pos.status !== 'done') {
+        logger.info(`MM: strategy ended (${pos.status}) | P&L: ${sign}$${totalPnl.toFixed(2)} | ${label}`);
+    }
+}
+
+async function _monitorLoop(pos, label) {
     while (true) {
         const msRemaining = new Date(pos.endTime).getTime() - Date.now();
 
@@ -230,92 +357,11 @@ async function monitorAndManage(pos) {
             break;
         }
 
-        // ── Check YES side ──────────────────────────────────────
-        if (!pos.yes.filled) {
-            let filled = false;
-            if (config.dryRun) {
-                const hitPrice = await simPriceHitTarget(pos.yes.tokenId);
-                if (hitPrice) { filled = true; pos.yes.fillPrice = hitPrice; }
-            } else {
-                filled = await isOrderFilled(pos.yes.orderId, pos.yes.shares, pos.yes.tokenId);
-                if (filled) pos.yes.fillPrice = config.mmSellPrice;
-            }
-            if (filled) {
-                pos.yes.filled = true;
-                const pnl = (pos.yes.fillPrice - pos.yes.entryPrice) * pos.yes.shares;
-                logger.money(`MM${config.dryRun ? '[SIM]' : ''}: YES filled @ $${pos.yes.fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
-            } else if (!config.dryRun) {
-                // Check for partial fill — if order is partially matched, handle it
-                const info = await getPartialFillInfo(pos.yes.orderId, pos.yes.shares, pos.yes.tokenId);
-                if (info.matched > 0 && info.remaining > 0 && info.remaining < pos.yes.shares * 0.90) {
-                    // Significant partial fill detected — cancel old order and handle remaining
-                    logger.warn(`MM: YES partially filled — ${info.matched.toFixed(3)}/${info.total.toFixed(3)} matched, ${info.remaining.toFixed(3)} remaining`);
-                    await cancelOrder(pos.yes.orderId);
-                    pos.yes.orderId = null;
-                    pos.yes.shares  = info.remaining; // update to remaining shares
-                    pos.yes._partialRevenue = (pos.yes._partialRevenue || 0) + info.matched * config.mmSellPrice;
-
-                    if (info.remaining < CLOB_MIN_ORDER_SHARES) {
-                        // Too few shares to re-place limit — market sell remainder
-                        logger.warn(`MM: YES remaining ${info.remaining.toFixed(3)} < ${CLOB_MIN_ORDER_SHARES} min — market selling remainder`);
-                        const result = await marketSell(pos.yes.tokenId, info.remaining, pos.tickSize, pos.negRisk);
-                        pos.yes.fillPrice = config.mmSellPrice; // weighted avg approximation
-                        pos.yes.filled = true;
-                        const pnl = (pos.yes._partialRevenue + result.fillPrice * info.remaining) - pos.yes.entryPrice * info.total;
-                        logger.money(`MM: YES fully sold (partial+market) | P&L $${pnl.toFixed(2)}`);
-                    } else {
-                        // Re-place limit sell for remaining shares
-                        const res = await placeLimitSell(pos.yes.tokenId, info.remaining, config.mmSellPrice, pos.tickSize, pos.negRisk);
-                        if (res.success) {
-                            pos.yes.orderId = res.orderId;
-                            logger.info(`MM: YES re-placed limit sell for ${info.remaining.toFixed(3)} shares @ $${config.mmSellPrice}`);
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Check NO side ───────────────────────────────────────
-        if (!pos.no.filled) {
-            let filled = false;
-            if (config.dryRun) {
-                const hitPrice = await simPriceHitTarget(pos.no.tokenId);
-                if (hitPrice) { filled = true; pos.no.fillPrice = hitPrice; }
-            } else {
-                filled = await isOrderFilled(pos.no.orderId, pos.no.shares, pos.no.tokenId);
-                if (filled) pos.no.fillPrice = config.mmSellPrice;
-            }
-            if (filled) {
-                pos.no.filled = true;
-                const pnl = (pos.no.fillPrice - pos.no.entryPrice) * pos.no.shares;
-                logger.money(`MM${config.dryRun ? '[SIM]' : ''}: NO  filled @ $${pos.no.fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
-            } else if (!config.dryRun) {
-                // Check for partial fill
-                const info = await getPartialFillInfo(pos.no.orderId, pos.no.shares, pos.no.tokenId);
-                if (info.matched > 0 && info.remaining > 0 && info.remaining < pos.no.shares * 0.90) {
-                    logger.warn(`MM: NO partially filled — ${info.matched.toFixed(3)}/${info.total.toFixed(3)} matched, ${info.remaining.toFixed(3)} remaining`);
-                    await cancelOrder(pos.no.orderId);
-                    pos.no.orderId = null;
-                    pos.no.shares  = info.remaining;
-                    pos.no._partialRevenue = (pos.no._partialRevenue || 0) + info.matched * config.mmSellPrice;
-
-                    if (info.remaining < CLOB_MIN_ORDER_SHARES) {
-                        logger.warn(`MM: NO remaining ${info.remaining.toFixed(3)} < ${CLOB_MIN_ORDER_SHARES} min — market selling remainder`);
-                        const result = await marketSell(pos.no.tokenId, info.remaining, pos.tickSize, pos.negRisk);
-                        pos.no.fillPrice = config.mmSellPrice;
-                        pos.no.filled = true;
-                        const pnl = (pos.no._partialRevenue + result.fillPrice * info.remaining) - pos.no.entryPrice * info.total;
-                        logger.money(`MM: NO fully sold (partial+market) | P&L $${pnl.toFixed(2)}`);
-                    } else {
-                        const res = await placeLimitSell(pos.no.tokenId, info.remaining, config.mmSellPrice, pos.tickSize, pos.negRisk);
-                        if (res.success) {
-                            pos.no.orderId = res.orderId;
-                            logger.info(`MM: NO re-placed limit sell for ${info.remaining.toFixed(3)} shares @ $${config.mmSellPrice}`);
-                        }
-                    }
-                }
-            }
-        }
+        // ── Check YES + NO sides in parallel ────────────────────
+        await Promise.all([
+            checkSideFill(pos, 'yes'),
+            checkSideFill(pos, 'no'),
+        ]);
 
         // ── Both filled → done ──────────────────────────────────
         if (pos.yes.filled && pos.no.filled) {
@@ -335,31 +381,33 @@ async function monitorAndManage(pos) {
         // ── Defensive pivot: neither filled after timeout (5m markets only) ──
         if (config.mmDefensiveEnabled && config.mmDuration === '5m'
             && !pos.yes.filled && !pos.no.filled && !pos._defensiveActive) {
-            // Measure from market open time (endTime - duration), not bot entry time
             const marketDurationMs = 5 * 60 * 1000;
             const marketStartMs = new Date(pos.endTime).getTime() - marketDurationMs;
             const elapsed = (Date.now() - marketStartMs) / 1000;
             if (elapsed >= config.mmDefensiveTimeout) {
                 // Cancel both orders FIRST so they can't fill while we wait
                 logger.warn(`MM: neither side filled after ${Math.round(elapsed)}s since market open — cancelling orders | ${label}`);
-                await cancelOrder(pos.yes.orderId);
-                await cancelOrder(pos.no.orderId);
+                await Promise.all([
+                    cancelOrder(pos.yes.orderId),
+                    cancelOrder(pos.no.orderId),
+                ]);
                 pos.yes.orderId = null;
                 pos.no.orderId = null;
 
                 // Re-check fills after cancellation — CLOB may have filled one side
                 // between our last check and the cancel (race condition)
-                await sleep(2000); // give CLOB API time to update
-                for (const key of ['yes', 'no']) {
-                    if (!pos[key].filled) {
-                        const balance = await getTokenBalance(pos[key].tokenId);
-                        if (balance !== null && balance < pos[key].shares * 0.05) {
-                            logger.warn(`MM: ${key.toUpperCase()} actually filled (on-chain balance ${balance.toFixed(3)} ≈ 0) — detected after cancel`);
-                            pos[key].filled = true;
-                            pos[key].fillPrice = config.mmSellPrice;
-                            const pnl = (pos[key].fillPrice - pos[key].entryPrice) * pos[key].shares;
-                            logger.money(`MM: ${key.toUpperCase()} filled @ $${pos[key].fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
-                        }
+                await sleep(2000);
+                const [yesBalance, noBalance] = await Promise.all([
+                    getTokenBalance(pos.yes.tokenId),
+                    getTokenBalance(pos.no.tokenId),
+                ]);
+                for (const [key, balance] of [['yes', yesBalance], ['no', noBalance]]) {
+                    if (!pos[key].filled && balance !== null && balance < pos[key].shares * 0.05) {
+                        logger.warn(`MM: ${key.toUpperCase()} actually filled (on-chain balance ${balance.toFixed(3)} ≈ 0) — detected after cancel`);
+                        pos[key].filled = true;
+                        pos[key].fillPrice = config.mmSellPrice;
+                        const pnl = (pos[key].fillPrice - pos[key].entryPrice) * pos[key].shares;
+                        logger.money(`MM: ${key.toUpperCase()} filled @ $${pos[key].fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
                     }
                 }
 
@@ -392,25 +440,28 @@ async function monitorAndManage(pos) {
             pos.status = 'cutting';
             const oneLegFilled = pos.yes.filled !== pos.no.filled;
             if (!config.mmAdaptiveCL && oneLegFilled) {
-                // Legacy: one side sold → immediate market sell on the other
                 const unfilledKey = pos.yes.filled ? 'no' : 'yes';
                 await cutLossOneLegFilled(pos, unfilledKey);
                 pos.status = 'done';
             } else {
-                // Neither filled → cancel both + merge back to USDC
                 await cutLossNeitherFilled(pos);
             }
             break;
         }
 
-        await sleep(10_000);
-    }
+        // ── Wait for WS fill event or polling fallback ───────────────────────
+        // WS gives us instant fill detection; polling at 30s is just a safety net
+        const watchTokens = [];
+        if (!pos.yes.filled) watchTokens.push(pos.yes.tokenId);
+        if (!pos.no.filled) watchTokens.push(pos.no.tokenId);
 
-    // Final P&L log
-    const totalPnl = calcPnl(pos);
-    const sign = totalPnl >= 0 ? '+' : '';
-    if (pos.status !== 'done') {
-        logger.info(`MM: strategy ended (${pos.status}) | P&L: ${sign}$${totalPnl.toFixed(2)} | ${label}`);
+        const wsEvent = await waitForFillOrTimeout(watchTokens, POLL_INTERVAL_MS);
+
+        if (wsEvent) {
+            // WS detected a fill — the onWsFill listener already updated pos,
+            // but loop back immediately to run the decision logic
+            logger.info(`MM: WS fill event received — re-checking immediately`);
+        }
     }
 }
 
@@ -445,8 +496,10 @@ async function cutLossNeitherFilled(pos) {
 
     // ── Best case: neither side sold → cancel both, merge back to USDC ──
     logger.warn('MM: neither side filled — cancelling orders and merging back to USDC...');
-    await cancelOrder(pos.yes.orderId);
-    await cancelOrder(pos.no.orderId);
+    await Promise.all([
+        cancelOrder(pos.yes.orderId),
+        cancelOrder(pos.no.orderId),
+    ]);
 
     // Read actual on-chain balances (may differ from original if partially consumed)
     const [yesActual, noActual] = await Promise.all([
