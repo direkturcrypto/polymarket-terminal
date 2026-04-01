@@ -100,6 +100,8 @@ const config = {
   makerMmRepriceThreshold: parseFloat(process.env.MAKER_MM_REPRICE_THRESHOLD || '0.02'), // reprice if bid drifts > this (default 2c)
   makerMmMinPrice: parseFloat(process.env.MAKER_MM_MIN_PRICE || '0.30'),   // min bid for rebate range (both sides)
   makerMmMaxPrice: parseFloat(process.env.MAKER_MM_MAX_PRICE || '0.69'),   // max bid for rebate range (both sides)
+  // When true: if expensive side fills first, cancel cheap side and hold to redemption
+  makerMmCancelCheapOnExpFill: process.env.MAKER_MM_CANCEL_CHEAP_ON_EXP_FILL === 'true',
 
   // ── Current Market Settings ────────────────────────────────────
   // Enable trading on current active market (not just next market)

@@ -12,7 +12,7 @@ import { Side, OrderType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
 import { getClient, getUsdcBalance, getPolygonProvider } from './client.js';
-import { mergePositions } from './ctf.js';
+import { mergePositions, redeemPositions } from './ctf.js';
 import { mmFillWatcher } from './mmWsFillWatcher.js';
 import logger from '../utils/logger.js';
 
@@ -351,6 +351,24 @@ async function monitorUntilFilled(pos, tag, label) {
                 logger.money(`MakerMM${tag}: NO filled (onchain) ${noShares.toFixed(4)} shares`);
             }
 
+            // ── Cancel cheap side when expensive fills first ──────────────────────
+            // When enabled: if the expensive side fills and cheap side hasn't,
+            // cancel the cheap order and hold the expensive token to redeem at resolution.
+            if (config.makerMmCancelCheapOnExpFill) {
+                const expSide  = pos.yes.buyPrice >= pos.no.buyPrice ? 'yes' : 'no';
+                const cheapSide = expSide === 'yes' ? 'no' : 'yes';
+                if (pos[expSide].filled && !pos[cheapSide].filled) {
+                    logger.info(
+                        `MakerMM${tag}: ${expSide.toUpperCase()} ($${pos[expSide].buyPrice}) filled first — ` +
+                        `cancelling cheap ${cheapSide.toUpperCase()} ($${pos[cheapSide].buyPrice}) order`
+                    );
+                    await cancelOrder(pos[cheapSide].orderId);
+                    pos.holdingSide = expSide;
+                    pos.status = 'holding';
+                    return;
+                }
+            }
+
             // ── Over-position safety net ────────────────────────────────────────
             // If one side's balance is > 1.5x target AND the current order is still open,
             // a double-fill occurred (old cancelled order + new order both filled).
@@ -567,6 +585,51 @@ async function executeMerge(pos, shares, tag) {
         logger.error(`MakerMM${tag}: merge failed — ${err.message}`);
         // Don't change status — let monitor loop continue
     }
+}
+
+// ── Auto-redeem after market resolution ──────────────────────────────────────
+// Used when holding a single-sided position (expensive side filled, cheap cancelled).
+// Polls until the market resolves on-chain, then calls redeemPositions.
+
+async function waitAndRedeem(pos, tag) {
+    const endMs = new Date(pos.endTime).getTime();
+    const waitForEndMs = endMs - Date.now();
+
+    if (waitForEndMs > 0) {
+        logger.info(`MakerMM${tag}: holding ${pos.holdingSide.toUpperCase()} — waiting ${Math.round(waitForEndMs / 1000)}s for market to end...`);
+        await sleep(waitForEndMs);
+    }
+
+    if (config.dryRun) {
+        logger.info(`MakerMM${tag}: [SIM] would redeem ${pos.holdingSide.toUpperCase()} after resolution`);
+        return;
+    }
+
+    logger.info(`MakerMM${tag}: market ended — polling for on-chain resolution...`);
+    const provider = getPolygonProvider();
+    const ctf = new ethers.Contract(CTF_ADDRESS, ['function payoutDenominator(bytes32 conditionId) view returns (uint256)'], provider);
+    const maxWaitMs = 10 * 60 * 1000; // 10 minutes max
+    const pollMs = 15_000;
+    const start = Date.now();
+
+    while (Date.now() - start < maxWaitMs) {
+        try {
+            const denom = await ctf.payoutDenominator(pos.conditionId);
+            if (!denom.isZero()) {
+                logger.info(`MakerMM${tag}: market resolved — redeeming ${pos.holdingSide.toUpperCase()} tokens...`);
+                await redeemPositions(pos.conditionId, pos.negRisk);
+                logger.money(`MakerMM${tag}: redemption complete`);
+                return;
+            }
+        } catch (err) {
+            logger.warn(`MakerMM${tag}: resolution poll error — ${err.message}`);
+        }
+        const elapsedSec = Math.round((Date.now() - start) / 1000);
+        logger.info(`MakerMM${tag}: not resolved yet (${elapsedSec}s / ${maxWaitMs / 1000}s) — retrying in ${pollMs / 1000}s...`);
+        await sleep(pollMs);
+    }
+
+    logger.warn(`MakerMM${tag}: market not resolved after ${maxWaitMs / 60000} minutes — skipping auto-redeem (tokens remain in wallet)`);
 }
 
 // ── Main entry ───────────────────────────────────────────────────────────────
@@ -838,6 +901,12 @@ export async function executeMakerRebateStrategy(market) {
     activePositions.set(conditionId, pos);
     await monitorUntilFilled(pos, tag, label);
     activePositions.delete(conditionId);
+
+    // If holding a single-sided position (expensive filled, cheap cancelled) — wait and redeem
+    if (pos.holdingSide) {
+        await waitAndRedeem(pos, tag);
+        return { oneSided: false }; // not a stuck one-sided cycle, intentional hold
+    }
 
     const sign = pos.totalProfit >= 0 ? '+' : '';
     logger.info(`MakerMM${tag}: done | P&L: ${sign}$${pos.totalProfit.toFixed(2)}`);
