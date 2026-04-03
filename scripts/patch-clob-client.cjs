@@ -32,18 +32,15 @@ if (!fs.existsSync(TARGET)) {
 
 let code = fs.readFileSync(TARGET, 'utf8');
 
-// Check if already patched
-if (code.includes('getProxyAgent')) {
-    console.log('[patch] @polymarket/clob-client already patched — skipping');
-    process.exit(0);
-}
+// Check if proxy support is already patched
+const proxyAlreadyPatched = code.includes('getProxyAgent');
+// Check if the JSON.stringify circular-ref fix is already applied
+const jsonFixAlreadyPatched = !code.includes('config: (_d = err.response)');
 
-// ── Inject proxy interceptor after axios import ─────────────────────────────
-// Instead of patching individual request configs (which causes circular
-// reference errors when the config gets serialized), we register an axios
-// request interceptor that injects httpsAgent on the fly.
+// ── 1. Proxy interceptor ─────────────────────────────────────────────────────
 
-const PATCH_CODE = `
+if (!proxyAlreadyPatched) {
+    const PATCH_CODE = `
 // ── Proxy support (auto-patched by scripts/patch-clob-client.cjs) ──────────
 const https_proxy_agent_1 = require("https-proxy-agent");
 let _cachedProxyAgent = null;
@@ -66,47 +63,52 @@ axios_1.default.interceptors.request.use(function(cfg) {
     }
     return cfg;
 });
-// Safe JSON.stringify that strips circular agent refs
-const _safeStringify = (obj) => JSON.stringify(obj, (key, val) => {
-    if (key === 'httpsAgent' || key === 'httpAgent' || key === 'agent') return undefined;
-    return val;
-});
 // ── End proxy patch ────────────────────────────────────────────────────────
 `;
-
-// Find axios import to inject after — try multiple patterns
-const axiosPatterns = [
-    // tslib __importDefault pattern (compiled TS)
-    /tslib_1\.__importDefault\s*\(\s*require\s*\(\s*["']axios["']\s*\)\s*\)\s*;/,
-    // Standard require
-    /require\s*\(\s*["']axios["']\s*\)\s*;/,
-];
-
-let injected = false;
-for (const pattern of axiosPatterns) {
-    const match = code.match(pattern);
-    if (match) {
-        code = code.replace(match[0], match[0] + PATCH_CODE);
-        console.log(`[patch] Injected proxy interceptor after axios import`);
-        injected = true;
-        break;
+    const axiosPatterns = [
+        /tslib_1\.__importDefault\s*\(\s*require\s*\(\s*["']axios["']\s*\)\s*\)\s*;/,
+        /require\s*\(\s*["']axios["']\s*\)\s*;/,
+    ];
+    let injected = false;
+    for (const pattern of axiosPatterns) {
+        const match = code.match(pattern);
+        if (match) {
+            code = code.replace(match[0], match[0] + PATCH_CODE);
+            console.log('[patch] Injected proxy interceptor after axios import');
+            injected = true;
+            break;
+        }
     }
+    if (!injected) {
+        console.error('[patch] Could not find axios import — skipping proxy patch');
+    }
+} else {
+    console.log('[patch] Proxy support already present — skipping');
 }
 
-if (!injected) {
-    console.error('[patch] Could not find axios import — skipping');
-    console.error('[patch] File content preview (first 1000 chars):');
-    console.error(code.substring(0, 1000));
-    process.exit(0);
-}
+// ── 2. Fix errorHandling circular JSON ───────────────────────────────────────
+// JSON.stringify(err.response.config) includes httpsAgent (from proxy) which
+// has circular/deep refs and causes "Maximum call stack size exceeded".
+// Replace with a simple log that only serializes the response data.
 
-// ── Patch errorHandling to avoid circular JSON serialization ────────────────
-// The CLOB client does JSON.stringify(err.response.config) which includes
-// httpsAgent with circular references. Replace with safe serializer.
-const jsonCount = (code.match(/JSON\.stringify\(/g) || []).length;
-code = code.replace(/JSON\.stringify\(/g, '_safeStringify(');
-const patchedCount = (code.match(/_safeStringify\(/g) || []).length;
-console.log(`[patch] Replaced ${jsonCount} JSON.stringify calls with safe serializer`);
+if (!jsonFixAlreadyPatched) {
+    const OLD_LOG = `console.error("[CLOB Client] request error", JSON.stringify({
+                status: (_a = err.response) === null || _a === void 0 ? void 0 : _a.status,
+                statusText: (_b = err.response) === null || _b === void 0 ? void 0 : _b.statusText,
+                data: (_c = err.response) === null || _c === void 0 ? void 0 : _c.data,
+                config: (_d = err.response) === null || _d === void 0 ? void 0 : _d.config,
+            }));`;
+    const NEW_LOG = `// config excluded — contains httpsAgent circular refs (stack overflow)
+            console.error("[CLOB Client] request error:", (_a = err.response) === null || _a === void 0 ? void 0 : _a.status, JSON.stringify((_b = err.response) === null || _b === void 0 ? void 0 : _b.data));`;
+    if (code.includes(OLD_LOG)) {
+        code = code.replace(OLD_LOG, NEW_LOG);
+        console.log('[patch] Fixed errorHandling circular JSON.stringify');
+    } else {
+        console.warn('[patch] Could not find errorHandling JSON.stringify — skipping (already fixed or SDK changed)');
+    }
+} else {
+    console.log('[patch] errorHandling JSON fix already applied — skipping');
+}
 
 fs.writeFileSync(TARGET, code, 'utf8');
-console.log('[patch] @polymarket/clob-client patched with proxy support ✅');
+console.log('[patch] @polymarket/clob-client patched ✅');
